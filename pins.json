@@ -1,0 +1,65 @@
+{
+  "schema": "chaff/pins@1",
+  "note": "Both encoder and decoder load-or-refuse against this file. Any mismatch is a hard boot failure. Frozen by the M0 autopilot; do not hand-edit without re-running `npm run verify`.",
+
+  "model": {
+    "id": "chaff-ref-lm@1",
+    "kind": "reference-lm",
+    "vocab": 256,
+    "contextTokens": 16,
+    "dModel": 32,
+    "nLayer": 2,
+    "nHead": 4,
+    "seed": "0x43484146",
+    "outputScale": 12.0,
+    "ffMult": 2,
+    "weightHash": "computed-at-boot",
+    "rationale": "M0 headless gates run against a self-contained deterministic transformer because the HuggingFace egress is blocked in the CI sandbox. The determinism-critical units under test (fixed-point softmax, argsort+bucket coder, crypto, harness) are model-agnostic. The real ONNX-Runtime-Web + Xenova/gpt2 backend is pinned separately below and exercised by the cross-arch tester (Chunk B) in a real browser for G2."
+  },
+
+  "ortBackend": {
+    "id": "Xenova/gpt2",
+    "runtime": "onnxruntime-web",
+    "ep": "wasm",
+    "dtype": "fp32",
+    "threads": 1,
+    "graphOptimizationLevel": "basic",
+    "opset": 14,
+    "transformersJs": "3.x",
+    "note": "Used only by the Chunk B cross-arch tester in-browser. Never on the local-gate coding path."
+  },
+
+  "tokenizer": {
+    "kind": "byte",
+    "normalization": "none",
+    "note": "Byte-level (identity) tokenizer for the reference LM. The ORT backend uses the Xenova/gpt2 BPE tokenizer, pinned via transformersJs above."
+  },
+
+  "codec": {
+    "logitScale": 1024,
+    "logitClampFix": 8388608,
+    "softmaxPrecBits": 16,
+    "expPolyId": "exp2neg-minimax-4",
+    "bucketWidth": 512,
+    "maxBitsPerStep": 6,
+    "tieBreak": "token-id-asc",
+    "rationale": "logitScale quantizes fp32 logits to integers (round(L*1024)). bucketWidth is the robustness/capacity dial swept by `npm run sweep`; 512 is the recorded knee for the reference LM (smallest width with >=0.98 per-token decision agreement under a ~0.008-logit simulated cross-arch perturbation). The coding decision runs on snap-to-grid bucketed logits: only the top 2^k candidates that sit in strictly-separated buckets carry bits, so per-arch logit noise that does not cross a bucket boundary cannot reorder the coding set."
+  },
+
+  "crypto": {
+    "kdf": "PBKDF2-SHA256",
+    "kdfIterations": 600000,
+    "keyBits": 256,
+    "aead": "AES-GCM",
+    "nonceBytes": 12,
+    "saltBytes": 16,
+    "tagBits": 128,
+    "note": "AES-GCM is the acceptable M0 spike AEAD. AES-SIV (nonce-misuse resistant) is the M2+ upgrade per the roadmap."
+  },
+
+  "payload": {
+    "magic": "CHF0",
+    "lengthFieldBits": 32,
+    "maxSecretBytes": 500
+  }
+}

@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chaff M0 — Cross-Arch Determinism Tester (G2)</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c232d; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #4dd0a7; --accent2: #58a6ff;
+    --bad: #f0616d; --good: #3fb950; --warn: #d29922; --border: #2a323d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 24px 18px 80px; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: .2px; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
+  .banner { background: #2a1d1d; border: 1px solid #5a2b2b; color: #ffd9d9;
+    border-radius: 8px; padding: 10px 14px; font-size: 12.5px; margin-bottom: 18px; }
+  .banner b { color: #ff9a9a; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px){ .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  textarea, input[type=text], input[type=password] {
+    width: 100%; background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 9px 10px; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+  textarea { min-height: 92px; }
+  button { background: var(--accent); color: #04140d; border: 0; border-radius: 7px;
+    padding: 9px 15px; font-weight: 650; cursor: pointer; font-size: 13px; }
+  button.secondary { background: var(--panel2); color: var(--fg); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .stat { color: var(--muted); font-size: 12px; }
+  .out { white-space: pre-wrap; word-break: break-word; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 7px; padding: 10px; margin-top: 10px; font: 12.5px ui-monospace, monospace; }
+  .pass { color: var(--good); font-weight: 700; }
+  .fail { color: var(--bad); font-weight: 700; }
+  .pill { display:inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+  .pill.on { color: var(--good); border-color: #1f4d2c; }
+  .setup { margin-bottom: 16px; }
+  code { color: var(--accent2); }
+  a { color: var(--accent2); }
+  .foot { color: var(--muted); font-size: 11.5px; margin-top: 26px; border-top: 1px solid var(--border); padding-top: 14px; }
+  .range { display: flex; align-items: center; gap: 10px; }
+  .range input { flex: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Chaff M0 · Cross-Arch Determinism Tester</h1>
+  <p class="sub">The one human step (<b>G2</b>): <b>Generate</b> a blob on machine A, <b>Verify</b> it on machine B
+    (different CPU/arch, e.g. ARM ↔ x86). PASS both-ways ⇒ GPT-2 logits are cross-arch deterministic enough for the
+    fixed-point codec ⇒ M1 is greenlit.</p>
+
+  <div class="banner">
+    <b>Honest threat model.</b> Chaff produces cover that reads as ordinary text to a human or a keyword filter.
+    It is <b>not</b> undetectable and does <b>not</b> defeat a trained steganography classifier that has this exact
+    model. Security rests on the adversary lacking the shared secret and lacking suspicion strong enough to run a
+    matched-model detector.
+  </div>
+
+  <div class="card setup">
+    <h2>Setup</h2>
+    <div class="row">
+      <span id="modelPill" class="pill">model: not loaded</span>
+      <span id="corePill" class="pill">core: …</span>
+      <button id="loadBtn" class="secondary">Load GPT-2 (Xenova/gpt2, WASM fp32, 1-thread)</button>
+    </div>
+    <label for="bw">bucketWidth (robustness/capacity dial · pinned knee shown) — <span id="bwVal"></span></label>
+    <div class="range">
+      <input id="bw" type="range" min="128" max="2048" step="64" />
+    </div>
+    <div class="stat" id="setupNote">Pins are loaded from the embedded core. Both panes must use the same bucketWidth.</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>① Generate (machine A)</h2>
+      <label for="gSecret">Secret</label>
+      <textarea id="gSecret" placeholder="Type the message to hide…">meet at the old pier, 9pm</textarea>
+      <label for="gPass">Shared secret (password)</label>
+      <input id="gPass" type="password" value="correct-horse-battery-staple" />
+      <div class="row"><button id="genBtn" disabled>Generate cover blob</button>
+        <span class="stat" id="genStat"></span></div>
+      <label for="gBlob">Cover blob — copy this to machine B</label>
+      <textarea id="gBlob" readonly placeholder="(blob appears here)"></textarea>
+      <div class="row"><button id="copyBtn" class="secondary" disabled>Copy blob</button></div>
+      <label>Reads-as (detokenized cover text)</label>
+      <div class="out" id="gText" style="max-height:120px; overflow:auto"></div>
+    </div>
+
+    <div class="card">
+      <h2>② Verify (machine B)</h2>
+      <label for="vBlob">Paste the cover blob from machine A</label>
+      <textarea id="vBlob" placeholder="(paste blob here)"></textarea>
+      <label for="vPass">Shared secret (password)</label>
+      <input id="vPass" type="password" value="correct-horse-battery-staple" />
+      <div class="row"><button id="verBtn" disabled>Verify &amp; recover</button>
+        <span class="stat" id="verStat"></span></div>
+      <div class="out" id="vOut">Awaiting a blob…</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Self-tests (run before trusting a cross-arch result)</h2>
+    <div class="row">
+      <button id="stCodec" class="secondary">Codec self-test (offline · no model)</button>
+      <button id="stGpt2" class="secondary" disabled>GPT-2 same-machine self-test</button>
+      <span class="stat" id="stStat"></span>
+    </div>
+    <div class="out" id="stOut">The offline codec self-test round-trips random secrets through the exact codec + crypto
+      that passes the Node gates (G1), using a deterministic mock logit source — it needs no model download. The GPT-2
+      self-test generates and verifies on THIS machine; it must PASS before a cross-arch attempt is meaningful.</div>
+  </div>
+
+  <div class="foot">
+    Determinism pins (embedded): backend ONNX-Runtime-Web · WASM EP · fp32 · single-thread. Codec: own fixed-point
+    softmax, snap-to-grid bucketed argsort. Crypto: PBKDF2 ≥600k → AES-256-GCM, fails closed via the GCM tag.
+    A FAIL here localizes to a stage (tokenizer / logit / softmax / bucket). Cross-arch FAIL after a same-machine PASS
+    ⇒ GPT-2 logits diverge across the two architectures at this bucket width — widen the bucket or narrow the product
+    to same-runtime pairs (the M0 decision matrix).
+  </div>
+</div>
+
+<!-- Shared browser core (esbuild IIFE, sets window.ChaffCore) — proven byte-identical to the Node gate core. -->
+<script>"use strict";
+var ChaffCoreNS = (() => {
+  var __defProp = Object.defineProperty;
+  var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __hasOwnProp = Object.prototype.hasOwnProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+  var __copyProps = (to, from, except, desc) => {
+    if (from && typeof from === "object" || typeof from === "function") {
+      for (let key of __getOwnPropNames(from))
+        if (!__hasOwnProp.call(to, key) && key !== except)
+          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    }
+    return to;
+  };
+  var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+
+  // src/browser/entry.ts
+  var entry_exports = {};
+  __export(entry_exports, {
+    ChaffCore: () => ChaffCore,
+    MockLogitSource: () => MockLogitSource,
+    decodeSecret: () => decodeSecret,
+    encodeSecret: () => encodeSecret
+  });
+
+  // pins.json
+  var pins_default = {
+    schema: "chaff/pins@1",
+    note: "Both encoder and decoder load-or-refuse against this file. Any mismatch is a hard boot failure. Frozen by the M0 autopilot; do not hand-edit without re-running `npm run verify`.",
+    model: {
+      id: "chaff-ref-lm@1",
+      kind: "reference-lm",
+      vocab: 256,
+      contextTokens: 16,
+      dModel: 32,
+      nLayer: 2,
+      nHead: 4,
+      seed: "0x43484146",
+      outputScale: 12,
+      ffMult: 2,
+      weightHash: "computed-at-boot",
+      rationale: "M0 headless gates run against a self-contained deterministic transformer because the HuggingFace egress is blocked in the CI sandbox. The determinism-critical units under test (fixed-point softmax, argsort+bucket coder, crypto, harness) are model-agnostic. The real ONNX-Runtime-Web + Xenova/gpt2 backend is pinned separately below and exercised by the cross-arch tester (Chunk B) in a real browser for G2."
+    },
+    ortBackend: {
+      id: "Xenova/gpt2",
+      runtime: "onnxruntime-web",
+      ep: "wasm",
+      dtype: "fp32",
+      threads: 1,
+      graphOptimizationLevel: "basic",
+      opset: 14,
+      transformersJs: "3.x",
+      note: "Used only by the Chunk B cross-arch tester in-browser. Never on the local-gate coding path."
+    },
+    tokenizer: {
+      kind: "byte",
+      normalization: "none",
+      note: "Byte-level (identity) tokenizer for the reference LM. The ORT backend uses the Xenova/gpt2 BPE tokenizer, pinned via transformersJs above."
+    },
+    codec: {
+      logitScale: 1024,
+      logitClampFix: 8388608,
+      softmaxPrecBits: 16,
+      expPolyId: "exp2neg-minimax-4",
+      bucketWidth: 512,
+      maxBitsPerStep: 6,
+      tieBreak: "token-id-asc",
+      rationale: "logitScale quantizes fp32 logits to integers (round(L*1024)). bucketWidth is the robustness/capacity dial swept by `npm run sweep`; 512 is the recorded knee for the reference LM (smallest width with >=0.98 per-token decision agreement under a ~0.008-logit simulated cross-arch perturbation). The coding decision runs on snap-to-grid bucketed logits: only the top 2^k candidates that sit in strictly-separated buckets carry bits, so per-arch logit noise that does not cross a bucket boundary cannot reorder the coding set."
+    },
+    crypto: {
+      kdf: "PBKDF2-SHA256",
+      kdfIterations: 6e5,
+      keyBits: 256,
+      aead: "AES-GCM",
+      nonceBytes: 12,
+      saltBytes: 16,
+      tagBits: 128,
+      note: "AES-GCM is the acceptable M0 spike AEAD. AES-SIV (nonce-misuse resistant) is the M2+ upgrade per the roadmap."
+    },
+    payload: {
+      magic: "CHF0",
+      lengthFieldBits: 32,
+      maxSecretBytes: 500
+    }
+  };
+
+  // src/util/bits.ts
+  var BitWriter = class {
+    constructor() {
+      __publicField(this, "bytes", []);
+      __publicField(this, "cur", 0);
+      __publicField(this, "nbits", 0);
+      __publicField(this, "total", 0);
+    }
+    writeBit(b) {
+      this.cur = this.cur << 1 | b & 1;
+      this.nbits++;
+      this.total++;
+      if (this.nbits === 8) {
+        this.bytes.push(this.cur & 255);
+        this.cur = 0;
+        this.nbits = 0;
+      }
+    }
+    /** Write the low `count` bits of `value`, MSB-first. */
+    writeBits(value, count) {
+      for (let i = count - 1; i >= 0; i--) this.writeBit(value >>> i & 1);
+    }
+    get bitLength() {
+      return this.total;
+    }
+    finish() {
+      let last = this.bytes.slice();
+      if (this.nbits > 0) {
+        last.push(this.cur << 8 - this.nbits & 255);
+      }
+      return { bytes: Uint8Array.from(last), bitLength: this.total };
+    }
+  };
+  var BitReader = class {
+    constructor(bytes, bitLength) {
+      __publicField(this, "bytes", bytes);
+      __publicField(this, "bitLength", bitLength);
+      __publicField(this, "pos", 0);
+    }
+    get remaining() {
+      return this.bitLength - this.pos;
+    }
+    get consumed() {
+      return this.pos;
+    }
+    readBit() {
+      if (this.pos >= this.bitLength) return 0;
+      const byte = this.bytes[this.pos >> 3];
+      const bit = byte >> 7 - (this.pos & 7) & 1;
+      this.pos++;
+      return bit;
+    }
+    /** Read `count` bits MSB-first into an unsigned integer. */
+    readBits(count) {
+      let v = 0;
+      for (let i = 0; i < count; i++) v = v << 1 | this.readBit();
+      return v >>> 0;
+    }
+  };
+
+  // src/fixedpoint.ts
+  var LOG2E_Q30 = 1549082004n;
+  var Q30 = 30n;
+  var P0 = 1073741824n;
+  var P1 = 744261230n;
+  var P2 = 257852109n;
+  var P3 = 59944301n;
+  var P4 = 9652713n;
+  function exp2FracQ30(gQ30) {
+    let acc = P4;
+    acc = acc * gQ30 >> Q30;
+    acc += P3;
+    acc = acc * gQ30 >> Q30;
+    acc += P2;
+    acc = acc * gQ30 >> Q30;
+    acc += P1;
+    acc = acc * gQ30 >> Q30;
+    acc += P0;
+    return acc;
+  }
+  function fixedPointSoftmax(quantLogits, cfg) {
+    const n = quantLogits.length;
+    const precBits = BigInt(cfg.softmaxPrecBits);
+    const denomBig = 1n << precBits;
+    const scale = BigInt(cfg.logitScale);
+    let maxQ = -Infinity;
+    for (let i = 0; i < n; i++) if (quantLogits[i] > maxQ) maxQ = quantLogits[i];
+    const maxQBig = BigInt(Math.round(maxQ));
+    const e = new Array(n);
+    let sum = 0n;
+    for (let i = 0; i < n; i++) {
+      const dq = BigInt(quantLogits[i] | 0) - maxQBig;
+      const negDq = -dq;
+      const tQ30 = negDq * LOG2E_Q30 / scale;
+      const iPart = tQ30 >> Q30;
+      const fPart = tQ30 - (iPart << Q30);
+      const twoPowF = exp2FracQ30(fPart);
+      let val = (denomBig << Q30) / twoPowF;
+      if (iPart >= 64n) {
+        val = 0n;
+      } else {
+        if (iPart > 0n) {
+          const half = 1n << iPart - 1n;
+          val = val + half >> iPart;
+        }
+      }
+      e[i] = val;
+      sum += val;
+    }
+    if (sum === 0n) {
+      const each = Number(denomBig / BigInt(n));
+      const probs2 = new Array(n).fill(each);
+      probs2[0] += Number(denomBig) - each * n;
+      return { probs: probs2, denom: Number(denomBig) };
+    }
+    const probs = new Array(n);
+    let allocated = 0n;
+    const rema = [];
+    for (let i = 0; i < n; i++) {
+      const scaled = e[i] * denomBig;
+      const q = scaled / sum;
+      const r = scaled - q * sum;
+      probs[i] = Number(q);
+      allocated += q;
+      rema.push({ idx: i, rem: r });
+    }
+    let leftover = Number(denomBig - allocated);
+    rema.sort((a, b) => a.rem === b.rem ? a.idx - b.idx : a.rem > b.rem ? -1 : 1);
+    for (let k = 0; k < rema.length && leftover > 0; k++) {
+      probs[rema[k].idx] += 1;
+      leftover--;
+    }
+    return { probs, denom: Number(denomBig) };
+  }
+  function entropyBits(probs, denom) {
+    let h = 0;
+    for (const p of probs) {
+      if (p <= 0) continue;
+      const pr = p / denom;
+      h -= pr * Math.log2(pr);
+    }
+    return h;
+  }
+
+  // src/util/hash.ts
+  var FNV_OFFSET = 2166136261;
+  var FNV_PRIME = 16777619;
+  function fnv1a(bytes) {
+    let h = FNV_OFFSET;
+    for (let i = 0; i < bytes.length; i++) {
+      h ^= bytes[i];
+      h = Math.imul(h, FNV_PRIME);
+    }
+    return h >>> 0;
+  }
+  function hashHex(bytes) {
+    return fnv1a(bytes).toString(16).padStart(8, "0");
+  }
+  function hashInts(values) {
+    const buf = new Uint8Array(values.length * 4);
+    const view = new DataView(buf.buffer);
+    for (let i = 0; i < values.length; i++) {
+      view.setInt32(i * 4, values[i] | 0, true);
+    }
+    return hashHex(buf);
+  }
+
+  // src/codec/coder.ts
+  var DivergenceError = class extends Error {
+    constructor(index, stage, message) {
+      super(message);
+      __publicField(this, "index", index);
+      __publicField(this, "stage", stage);
+      this.name = "DivergenceError";
+    }
+  };
+  function quantize(logits, logitScale) {
+    const q = new Int32Array(logits.length);
+    for (let i = 0; i < logits.length; i++) q[i] = Math.round(logits[i] * logitScale) | 0;
+    return q;
+  }
+  function bucketId(q, width) {
+    return Math.round(q / width);
+  }
+  function planStep(logits, cfg) {
+    const quant = quantize(logits, cfg.logitScale);
+    const V = quant.length;
+    const W = cfg.bucketWidth;
+    const bucket = new Int32Array(V);
+    for (let i = 0; i < V; i++) bucket[i] = bucketId(quant[i], W);
+    const idx = Array.from({ length: V }, (_, i) => i);
+    idx.sort((a, b) => bucket[b] - bucket[a] || a - b);
+    const maxK = Math.min(cfg.maxBitsPerStep, Math.floor(Math.log2(V)));
+    let k = 0;
+    for (let cand = 1; cand <= maxK; cand++) {
+      const m = 1 << cand;
+      let ok = true;
+      for (let j = 0; j < m - 1; j++) {
+        if (bucket[idx[j]] - bucket[idx[j + 1]] < 1) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) k = cand;
+      else break;
+    }
+    const sm = fixedPointSoftmax(Array.from(quant), {
+      logitScale: cfg.logitScale,
+      softmaxPrecBits: cfg.softmaxPrecBits
+    });
+    return { quant, ranking: idx, k, probs: sm.probs, denom: sm.denom };
+  }
+  function makeTrace(index, prefixLen, tokenId, plan, selectedRank) {
+    const topN = Math.min(plan.ranking.length, 64);
+    return {
+      index,
+      prefixLen,
+      tokenId,
+      logitsHash: hashInts(plan.quant),
+      softmaxHash: hashInts(plan.probs),
+      rankingHash: hashInts(plan.ranking.slice(0, topN)),
+      k: plan.k,
+      selectedRank,
+      entropyBits: entropyBits(plan.probs, plan.denom)
+    };
+  }
+  function encode(source, payload, payloadBitLength, cfg, seedPrefix = []) {
+    const reader = new BitReader(payload, payloadBitLength);
+    const prefix = seedPrefix.slice();
+    const cover = [];
+    const trace = [];
+    const maxSteps = cfg.maxSteps ?? payloadBitLength * 8 + 64;
+    let step = 0;
+    while (reader.remaining > 0) {
+      if (step >= maxSteps) {
+        throw new Error(
+          `encode exceeded ${maxSteps} steps with ${reader.remaining} bits left \u2014 model capacity too low for this bucketWidth.`
+        );
+      }
+      const logits = source.logits(prefix);
+      const plan = planStep(logits, cfg);
+      const k = plan.k;
+      const j = k > 0 ? reader.readBits(k) : 0;
+      const tokenId = plan.ranking[j];
+      cover.push(tokenId);
+      trace.push(makeTrace(step, prefix.length, tokenId, plan, j));
+      prefix.push(tokenId);
+      step++;
+    }
+    return { cover, trace, bitsCarried: payloadBitLength, steps: step };
+  }
+  function decode(source, cover, cfg, wantBits, seedPrefix = []) {
+    const prefix = seedPrefix.slice();
+    const writer = new BitWriter();
+    const trace = [];
+    for (let step = 0; step < cover.length; step++) {
+      if (wantBits !== void 0 && writer.bitLength >= wantBits) break;
+      const logits = source.logits(prefix);
+      const plan = planStep(logits, cfg);
+      const observed = cover[step];
+      const j = plan.ranking.indexOf(observed);
+      if (j < 0) {
+        throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+      }
+      const usable = 1 << plan.k;
+      if (plan.k > 0 && j >= usable) {
+        throw new DivergenceError(
+          step,
+          "bucket",
+          `observed token rank ${j} outside usable set (k=${plan.k}, top ${usable}) at step ${step}`
+        );
+      }
+      if (plan.k > 0) writer.writeBits(j, plan.k);
+      trace.push(makeTrace(step, prefix.length, observed, plan, j));
+      prefix.push(observed);
+    }
+    const fin = writer.finish();
+    return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
+  }
+
+  // src/crypto/aead.ts
+  var webcrypto = globalThis.crypto;
+  var subtle = webcrypto.subtle;
+  var DEFAULT_PARAMS = {
+    kdfIterations: 6e5,
+    saltBytes: 16,
+    nonceBytes: 12,
+    keyBits: 256
+  };
+  async function deriveKey(password, salt, params) {
+    const baseKey = await subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, [
+      "deriveKey"
+    ]);
+    return subtle.deriveKey(
+      { name: "PBKDF2", salt: bufferSource(salt), iterations: params.kdfIterations, hash: "SHA-256" },
+      baseKey,
+      { name: "AES-GCM", length: params.keyBits },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+  function bufferSource(u) {
+    return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+  }
+  async function seal(password, plaintext, aad, params = DEFAULT_PARAMS) {
+    const salt = webcrypto.getRandomValues(new Uint8Array(params.saltBytes));
+    const nonce = webcrypto.getRandomValues(new Uint8Array(params.nonceBytes));
+    const key = await deriveKey(password, salt, params);
+    const ct = new Uint8Array(
+      await subtle.encrypt(
+        { name: "AES-GCM", iv: bufferSource(nonce), additionalData: bufferSource(aad) },
+        key,
+        bufferSource(plaintext)
+      )
+    );
+    const out = new Uint8Array(salt.length + nonce.length + ct.length);
+    out.set(salt, 0);
+    out.set(nonce, salt.length);
+    out.set(ct, salt.length + nonce.length);
+    return out;
+  }
+  async function open(password, blob, aad, params = DEFAULT_PARAMS) {
+    const salt = blob.slice(0, params.saltBytes);
+    const nonce = blob.slice(params.saltBytes, params.saltBytes + params.nonceBytes);
+    const ct = blob.slice(params.saltBytes + params.nonceBytes);
+    const key = await deriveKey(password, salt, params);
+    const pt = new Uint8Array(
+      await subtle.decrypt(
+        { name: "AES-GCM", iv: bufferSource(nonce), additionalData: bufferSource(aad) },
+        key,
+        bufferSource(ct)
+      )
+    );
+    return pt;
+  }
+
+  // src/harness/localizer.ts
+  function classify(a, b) {
+    if (a.logitsHash !== b.logitsHash) return "logit";
+    if (a.softmaxHash !== b.softmaxHash) return "softmax";
+    if (a.k !== b.k || a.rankingHash !== b.rankingHash) return "bucket";
+    if (a.tokenId !== b.tokenId || a.selectedRank !== b.selectedRank) return "tokenizer";
+    return "none";
+  }
+  function localize(encTrace, decTrace) {
+    const n = Math.min(encTrace.length, decTrace.length);
+    for (let i = 0; i < n; i++) {
+      const a = encTrace[i];
+      const b = decTrace[i];
+      const stage = classify(a, b);
+      if (stage !== "none") {
+        return {
+          diverged: true,
+          index: i,
+          stage,
+          detail: describe(stage, a, b)
+        };
+      }
+    }
+    if (encTrace.length !== decTrace.length) {
+      return {
+        diverged: true,
+        index: n,
+        stage: "bucket",
+        detail: `trace length mismatch: enc=${encTrace.length} dec=${decTrace.length} (capacity/stop desync)`
+      };
+    }
+    return { diverged: false, index: -1, stage: "none", detail: "traces identical" };
+  }
+  function describe(stage, a, b) {
+    switch (stage) {
+      case "logit":
+        return `raw logits differ (enc ${a.logitsHash} vs dec ${b.logitsHash}) at token index ${a.index}`;
+      case "softmax":
+        return `fixed-point softmax differs (enc ${a.softmaxHash} vs dec ${b.softmaxHash}) at token index ${a.index}`;
+      case "bucket":
+        return `bucketing differs (enc k=${a.k}/${a.rankingHash} vs dec k=${b.k}/${b.rankingHash}) at token index ${a.index}`;
+      case "tokenizer":
+        return `carried token differs (enc tok=${a.tokenId}#${a.selectedRank} vs dec tok=${b.tokenId}#${b.selectedRank}) at token index ${a.index}`;
+      default:
+        return "identical";
+    }
+  }
+
+  // src/util/prng.ts
+  var MASK64 = (1n << 64n) - 1n;
+  var SplitMix64 = class {
+    constructor(seed) {
+      __publicField(this, "state");
+      this.state = seed & MASK64;
+    }
+    /** Next raw 64-bit value. */
+    nextU64() {
+      this.state = this.state + 0x9e3779b97f4a7c15n & MASK64;
+      let z = this.state;
+      z = (z ^ z >> 30n) * 0xbf58476d1ce4e5b9n & MASK64;
+      z = (z ^ z >> 27n) * 0x94d049bb133111ebn & MASK64;
+      z = z ^ z >> 31n;
+      return z & MASK64;
+    }
+    /** Uniform float in [0,1) with 53 bits of entropy. */
+    nextFloat() {
+      const v = this.nextU64() >> 11n;
+      return Number(v) / 9007199254740992;
+    }
+    /** Standard-normal-ish sample via Box–Muller (deterministic). */
+    nextGaussian() {
+      let u1 = this.nextFloat();
+      const u2 = this.nextFloat();
+      if (u1 < 1e-12) u1 = 1e-12;
+      const r = Math.sqrt(-2 * Math.log(u1));
+      return r * Math.cos(2 * Math.PI * u2);
+    }
+  };
+
+  // src/browser/entry.ts
+  var pins = pins_default;
+  function hashOf(a) {
+    return hashInts(a);
+  }
+  function coderConfig(bucketWidthOverride) {
+    return {
+      logitScale: pins.codec.logitScale,
+      bucketWidth: bucketWidthOverride ?? pins.codec.bucketWidth,
+      maxBitsPerStep: pins.codec.maxBitsPerStep,
+      softmaxPrecBits: pins.codec.softmaxPrecBits
+    };
+  }
+  function cryptoParams() {
+    return {
+      kdfIterations: pins.crypto.kdfIterations,
+      saltBytes: pins.crypto.saltBytes,
+      nonceBytes: pins.crypto.nonceBytes,
+      keyBits: pins.crypto.keyBits
+    };
+  }
+  function framePayload(blob) {
+    const w = new BitWriter();
+    w.writeBits(blob.length, pins.payload.lengthFieldBits);
+    for (const b of blob) w.writeBits(b, 8);
+    return w.finish();
+  }
+  function unframePayload(bits, bitLength) {
+    const r = new BitReader(bits, bitLength);
+    const blobLen = r.readBits(pins.payload.lengthFieldBits);
+    const blob = new Uint8Array(blobLen);
+    for (let i = 0; i < blobLen; i++) blob[i] = r.readBits(8);
+    return blob;
+  }
+  async function asyncEncode(source, payload, payloadBitLength, cfg) {
+    const reader = new BitReader(payload, payloadBitLength);
+    const prefix = [];
+    const cover = [];
+    const trace = [];
+    const maxSteps = payloadBitLength * 8 + 64;
+    let step = 0;
+    while (reader.remaining > 0) {
+      if (step >= maxSteps) throw new Error("encode exceeded step cap \u2014 model capacity too low for this bucketWidth.");
+      const plan = planStep(await source.logits(prefix), cfg);
+      const j = plan.k > 0 ? reader.readBits(plan.k) : 0;
+      const tokenId = plan.ranking[j];
+      cover.push(tokenId);
+      trace.push(traceOf(step, prefix.length, tokenId, plan, j));
+      prefix.push(tokenId);
+      step++;
+    }
+    return { cover, trace };
+  }
+  async function asyncDecode(source, cover, cfg) {
+    const prefix = [];
+    const w = new BitWriter();
+    const trace = [];
+    for (let step = 0; step < cover.length; step++) {
+      const plan = planStep(await source.logits(prefix), cfg);
+      const observed = cover[step];
+      const j = plan.ranking.indexOf(observed);
+      if (j < 0) throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+      if (plan.k > 0 && j >= 1 << plan.k)
+        throw new DivergenceError(step, "bucket", `observed token rank ${j} outside usable set (k=${plan.k}) at step ${step}`);
+      if (plan.k > 0) w.writeBits(j, plan.k);
+      trace.push(traceOf(step, prefix.length, observed, plan, j));
+      prefix.push(observed);
+    }
+    const fin = w.finish();
+    return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
+  }
+  function traceOf(index, prefixLen, tokenId, plan, selectedRank) {
+    const topN = Math.min(plan.ranking.length, 64);
+    return {
+      index,
+      prefixLen,
+      tokenId,
+      logitsHash: hashOf(plan.quant),
+      softmaxHash: hashOf(plan.probs),
+      rankingHash: hashOf(plan.ranking.slice(0, topN)),
+      k: plan.k,
+      selectedRank,
+      entropyBits: entropyBits(plan.probs, plan.denom)
+    };
+  }
+  async function encodeSecret(source, password, secret, bucketWidth) {
+    const aad = new TextEncoder().encode(pins.payload.magic);
+    const blob = await seal(password, secret, aad, cryptoParams());
+    const framed = framePayload(blob);
+    const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
+    return { cover: r.cover, trace: r.trace, blobBytes: blob.length, payloadBits: framed.bitLength };
+  }
+  async function decodeSecret(source, password, cover, bucketWidth) {
+    const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
+    const blob = unframePayload(dec.bytes, dec.bitLength);
+    const aad = new TextEncoder().encode(pins.payload.magic);
+    const secret = await open(password, blob, aad, cryptoParams());
+    return { secret, trace: dec.trace };
+  }
+  var MockLogitSource = class {
+    constructor(vocab = 256) {
+      __publicField(this, "vocabSize");
+      __publicField(this, "id", "chaff-mock@1");
+      __publicField(this, "weightHash", "mock");
+      this.vocabSize = vocab;
+    }
+    logits(prefix) {
+      let seed = 0x9e3779b9n;
+      for (let i = 0; i < prefix.length; i++) seed = seed * 1000003n + BigInt(prefix[i] + 1) & (1n << 64n) - 1n;
+      const rng = new SplitMix64(seed);
+      const out = new Float64Array(this.vocabSize);
+      for (let i = 0; i < this.vocabSize; i++) out[i] = rng.nextGaussian() * 4;
+      return out;
+    }
+  };
+  var ChaffCore = {
+    encodeSecret,
+    decodeSecret,
+    asyncEncode,
+    asyncDecode,
+    planStep,
+    encode,
+    decode,
+    localize,
+    fixedPointSoftmax,
+    entropyBits,
+    seal,
+    open,
+    BitReader,
+    BitWriter,
+    DivergenceError,
+    MockLogitSource,
+    coderConfig,
+    cryptoParams,
+    pins
+  };
+  globalThis.ChaffCore = ChaffCore;
+  return __toCommonJS(entry_exports);
+})();
+</script>
+
+<script type="module">
+import {
+  AutoTokenizer, AutoModelForCausalLM, Tensor, env,
+} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5/dist/transformers.min.js";
+
+const Core = window.ChaffCore;
+const $ = (id) => document.getElementById(id);
+const pins = Core.pins;
+
+// Determinism backend pins.
+env.allowLocalModels = false;
+env.backends.onnx.wasm.numThreads = 1; // single-thread (mandate #1)
+
+document.getElementById("corePill").textContent = "core: ready";
+document.getElementById("corePill").classList.add("on");
+
+const GPT2_EOT = 50256; // <|endoftext|> used as the fixed start token
+let tokenizer = null, model = null, VOCAB = 50257;
+
+// --- bucketWidth control ---
+const bw = $("bw");
+bw.value = String(pins.codec.bucketWidth);
+$("bwVal").textContent = `${pins.codec.bucketWidth} (pinned knee)`;
+bw.addEventListener("input", () => {
+  $("bwVal").textContent = bw.value + (Number(bw.value) === pins.codec.bucketWidth ? " (pinned knee)" : "");
+});
+const bucketWidth = () => Number(bw.value);
+
+// --- GPT-2 async logit source (mandate #1 backend; async because forward is async) ---
+class Gpt2Source {
+  constructor() { this.vocabSize = VOCAB; this.id = "Xenova/gpt2"; this.weightHash = "onnx-fp32"; }
+  async logits(prefix) {
+    const ids = [GPT2_EOT, ...prefix];
+    const n = ids.length;
+    const input_ids = new Tensor("int64", BigInt64Array.from(ids.map((x) => BigInt(x))), [1, n]);
+    const attention_mask = new Tensor("int64", BigInt64Array.from(ids.map(() => 1n)), [1, n]);
+    const out = await model({ input_ids, attention_mask });
+    const t = out.logits;               // [1, seq, vocab], Float32
+    const seq = t.dims[1], V = t.dims[2];
+    const data = t.data;
+    const off = (seq - 1) * V;
+    const f = new Float64Array(V);
+    for (let i = 0; i < V; i++) f[i] = data[off + i];
+    return f;
+  }
+}
+const gpt2 = new Gpt2Source();
+
+// --- compact blob: base64 of [CHF0][ver u8][count u32-le][count × u16-le token ids] ---
+function tokensToBlob(cover) {
+  const buf = new Uint8Array(4 + 1 + 4 + cover.length * 2);
+  const dv = new DataView(buf.buffer);
+  buf[0]=0x43;buf[1]=0x48;buf[2]=0x46;buf[3]=0x30; // "CHF0"
+  dv.setUint8(4, 1);
+  dv.setUint32(5, cover.length, true);
+  for (let i = 0; i < cover.length; i++) dv.setUint16(9 + i * 2, cover[i], true);
+  let s = ""; for (const b of buf) s += String.fromCharCode(b);
+  return btoa(s);
+}
+function blobToTokens(b64) {
+  const clean = b64.trim().replace(/\s+/g, "");
+  const s = atob(clean);
+  const buf = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) buf[i] = s.charCodeAt(i);
+  const dv = new DataView(buf.buffer);
+  if (!(buf[0]===0x43&&buf[1]===0x48&&buf[2]===0x46&&buf[3]===0x30)) throw new Error("bad blob magic (not a Chaff blob)");
+  const count = dv.getUint32(5, true);
+  const cover = new Array(count);
+  for (let i = 0; i < count; i++) cover[i] = dv.getUint16(9 + i * 2, true);
+  return cover;
+}
+
+// --- model load ---
+$("loadBtn").addEventListener("click", async () => {
+  $("loadBtn").disabled = true;
+  $("modelPill").textContent = "model: loading…";
+  try {
+    tokenizer = await AutoTokenizer.from_pretrained("Xenova/gpt2");
+    model = await AutoModelForCausalLM.from_pretrained("Xenova/gpt2", { dtype: "fp32", device: "wasm" });
+    // probe vocab
+    const probe = await gpt2.logits([]);
+    VOCAB = probe.length; gpt2.vocabSize = VOCAB;
+    $("modelPill").textContent = `model: GPT-2 ready (vocab ${VOCAB})`;
+    $("modelPill").classList.add("on");
+    $("genBtn").disabled = false; $("verBtn").disabled = false; $("stGpt2").disabled = false;
+  } catch (e) {
+    $("modelPill").textContent = "model: load FAILED";
+    $("loadBtn").disabled = false;
+    alert("Model load failed: " + (e?.message || e) + "\n(Needs network to fetch Xenova/gpt2 the first time.)");
+  }
+});
+
+// --- Generate ---
+$("genBtn").addEventListener("click", async () => {
+  const secret = new TextEncoder().encode($("gSecret").value);
+  if (secret.length === 0 || secret.length > pins.payload.maxSecretBytes) {
+    $("genStat").textContent = `secret must be 1–${pins.payload.maxSecretBytes} bytes`; return;
+  }
+  $("genBtn").disabled = true; $("genStat").textContent = "generating…";
+  try {
+    const t0 = performance.now();
+    const enc = await Core.encodeSecret(gpt2, $("gPass").value, secret, bucketWidth());
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    $("gBlob").value = tokensToBlob(enc.cover);
+    $("copyBtn").disabled = false;
+    const text = tokenizer.decode(enc.cover, { skip_special_tokens: true });
+    $("gText").textContent = text;
+    const bpt = (enc.payloadBits / enc.cover.length).toFixed(2);
+    $("genStat").textContent = `${secret.length}B secret → ${enc.blobBytes}B blob → ${enc.cover.length} tokens (${bpt} bits/tok, ${dt}s)`;
+  } catch (e) {
+    $("genStat").textContent = "error: " + (e?.message || e);
+  }
+  $("genBtn").disabled = false;
+});
+$("copyBtn").addEventListener("click", () => navigator.clipboard.writeText($("gBlob").value));
+
+// --- Verify ---
+$("verBtn").addEventListener("click", async () => {
+  $("verBtn").disabled = true; $("verStat").textContent = "verifying…"; $("vOut").textContent = "";
+  try {
+    const cover = blobToTokens($("vBlob").value);
+    const t0 = performance.now();
+    const dec = await Core.decodeSecret(gpt2, $("vPass").value, cover, bucketWidth());
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    const text = new TextDecoder().decode(dec.secret);
+    $("vOut").innerHTML = `<span class="pass">PASS</span> — recovered ${dec.secret.length}B in ${dt}s\n\n` + escapeHtml(text);
+    $("verStat").textContent = "cross-arch round-trip OK";
+  } catch (e) {
+    const stage = e?.stage ? ` [stage: ${e.stage}` + (e.index >= 0 ? `, token index ${e.index}]` : "]") : "";
+    $("vOut").innerHTML = `<span class="fail">FAIL</span>${stage}\n\n${escapeHtml(e?.message || String(e))}\n\n` +
+      `If the codec/GPT-2 self-tests PASS on this machine but cross-arch FAILs here, GPT-2 logits diverge across the two ` +
+      `architectures at this bucket width. Widen bucketWidth and re-Generate on machine A, or record a same-runtime-only result.`;
+    $("verStat").textContent = "divergence";
+  }
+  $("verBtn").disabled = false;
+});
+
+// --- Offline codec self-test (no model; uses the mock source = same core as the gates) ---
+$("stCodec").addEventListener("click", async () => {
+  $("stStat").textContent = "running offline codec self-test…"; $("stOut").textContent = "";
+  const mock = new Core.MockLogitSource(256);
+  let pass = 0; const N = 12; const lines = [];
+  for (let i = 0; i < N; i++) {
+    const len = 1 + ((i * 41 + 7) % 120);
+    const secret = new Uint8Array(len);
+    for (let j = 0; j < len; j++) secret[j] = (j * 31 + i * 7) & 0xff;
+    const pw = "pw" + i;
+    try {
+      const enc = await Core.encodeSecret(mock, pw, secret, bucketWidth());
+      const dec = await Core.decodeSecret(mock, pw, enc.cover, bucketWidth());
+      const ok = dec.secret.length === len && dec.secret.every((b, k) => b === secret[k]);
+      if (ok) pass++; else lines.push(`  trial ${i}: MISMATCH`);
+    } catch (e) { lines.push(`  trial ${i}: ${e?.message || e}`); }
+  }
+  const ok = pass === N;
+  $("stOut").innerHTML = `<span class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</span> offline codec+crypto ${pass}/${N} round-trips` +
+    (lines.length ? "\n" + escapeHtml(lines.join("\n")) : "") +
+    `\n\nThis exercises the exact codec + crypto that passes the Node G1 gate (mock logit source, no GPT-2).`;
+  $("stStat").textContent = ok ? "offline codec OK" : "offline codec FAILED";
+});
+
+// --- GPT-2 same-machine self-test ---
+$("stGpt2").addEventListener("click", async () => {
+  $("stGpt2").disabled = true; $("stStat").textContent = "GPT-2 same-machine self-test…"; $("stOut").textContent = "";
+  const samples = ["hi", "meet at noon", "the quick brown fox jumps over the lazy dog"];
+  let pass = 0; const lines = [];
+  for (const s of samples) {
+    const secret = new TextEncoder().encode(s);
+    try {
+      const enc = await Core.encodeSecret(gpt2, "selftest-pw", secret, bucketWidth());
+      const cover = blobToTokens(tokensToBlob(enc.cover)); // exercise the blob round-trip too
+      const dec = await Core.decodeSecret(gpt2, "selftest-pw", cover, bucketWidth());
+      const back = new TextDecoder().decode(dec.secret);
+      if (back === s) { pass++; lines.push(`  ok: "${s}" (${enc.cover.length} tok)`); }
+      else lines.push(`  MISMATCH: "${s}" → "${back}"`);
+    } catch (e) { lines.push(`  FAIL "${s}": ${e?.message || e}`); }
+  }
+  const ok = pass === samples.length;
+  $("stOut").innerHTML = `<span class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</span> GPT-2 same-machine ${pass}/${samples.length}\n` +
+    escapeHtml(lines.join("\n")) + `\n\nGreen here means the full path works on THIS machine; now try cross-arch (Generate here, Verify on the other machine).`;
+  $("stStat").textContent = ok ? "GPT-2 self-test OK" : "GPT-2 self-test FAILED";
+  $("stGpt2").disabled = false;
+});
+
+function escapeHtml(s){ return s.replace(/[&<>]/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+</script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "chaff",
+  "version": "0.0.0-m0",
+  "private": true,
+  "type": "module",
+  "description": "Chaff M0 — browser-native linguistic steganography determinism spike (headless).",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "verify": "tsx src/verify.ts",
+    "sweep": "tsx src/codec/sweep.ts",
+    "selftest:crypto": "tsx src/crypto/vectors.ts",
+    "parity": "tsx scripts/parity.ts",
+    "check:bundle": "tsx scripts/bundle-check.ts",
+    "typecheck": "tsc --noEmit",
+    "build:browser": "tsx scripts/build-browser.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
