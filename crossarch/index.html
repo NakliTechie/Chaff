@@ -153,7 +153,9 @@ var ChaffCoreNS = (() => {
   __export(entry_exports, {
     ChaffCore: () => ChaffCore,
     MockLogitSource: () => MockLogitSource,
+    decodeMessage: () => decodeMessage,
     decodeSecret: () => decodeSecret,
+    encodeMessage: () => encodeMessage,
     encodeSecret: () => encodeSecret
   });
 
@@ -783,6 +785,59 @@ var ChaffCoreNS = (() => {
     }
   };
 
+  // src/conversation.ts
+  var CHAIN_LEN = 16;
+  var HEADER_LEN = 1 + 4 + CHAIN_LEN;
+  var VERSION = 1;
+  function bufOf(u) {
+    return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+  }
+  async function sha256(data) {
+    return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bufOf(data)));
+  }
+  async function genesisChain(conversationId) {
+    const h = await sha256(new TextEncoder().encode("chaff-chain-v1:" + conversationId));
+    return h.slice(0, CHAIN_LEN);
+  }
+  async function nextChain(prev, blob) {
+    const cat = new Uint8Array(prev.length + blob.length);
+    cat.set(prev, 0);
+    cat.set(blob, prev.length);
+    return (await sha256(cat)).slice(0, CHAIN_LEN);
+  }
+  function buildHeader(seq, prevChain) {
+    const h = new Uint8Array(HEADER_LEN);
+    h[0] = VERSION;
+    new DataView(h.buffer).setUint32(1, seq >>> 0, false);
+    h.set(prevChain.subarray(0, CHAIN_LEN), 5);
+    return h;
+  }
+  function parseHeader(pt) {
+    if (pt.length < HEADER_LEN || pt[0] !== VERSION) throw new Error("bad conversation header");
+    const seq = new DataView(pt.buffer, pt.byteOffset, pt.byteLength).getUint32(1, false);
+    return { seq, prevChain: pt.slice(5, 5 + CHAIN_LEN), body: pt.slice(HEADER_LEN) };
+  }
+  function bytesEq(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  function verifyChain(state, header) {
+    const warnings = [];
+    if (!bytesEq(header.prevChain, state.chain)) warnings.push("chain-mismatch");
+    if (header.seq <= state.seq) warnings.push("reorder-or-replay");
+    else if (header.seq > state.seq + 1) warnings.push("missing-message");
+    return { seq: header.seq, ok: warnings.length === 0, warnings };
+  }
+  function describeStatus(s) {
+    if (s.ok) return `message #${s.seq} \xB7 chain intact`;
+    const parts = [];
+    if (s.warnings.includes("missing-message")) parts.push("a message may be missing before this one");
+    if (s.warnings.includes("reorder-or-replay")) parts.push("out of order or replayed");
+    if (s.warnings.includes("chain-mismatch")) parts.push("chain broken (tampering, a drop, or a desync)");
+    return `message #${s.seq} \xB7 ${parts.join("; ")}`;
+  }
+
   // src/browser/entry.ts
   var pins = pins_default;
   function hashOf(a) {
@@ -882,6 +937,32 @@ var ChaffCoreNS = (() => {
     const secret = await openSiv(password, blob, aad, cryptoParams());
     return { secret, trace: dec.trace };
   }
+  function convAad(conversationId) {
+    return new TextEncoder().encode(pins.payload.magic + ":" + conversationId);
+  }
+  async function encodeMessage(source, password, secret, conversationId, state, bucketWidth) {
+    const prevChain = state ? state.chain : await genesisChain(conversationId);
+    const seq = (state ? state.seq : 0) + 1;
+    const header = buildHeader(seq, prevChain);
+    const pt = new Uint8Array(header.length + secret.length);
+    pt.set(header, 0);
+    pt.set(secret, header.length);
+    const blob = await sealSiv(password, pt, convAad(conversationId), cryptoParams());
+    const framed = framePayload(blob);
+    const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
+    const chain = await nextChain(prevChain, blob);
+    return { cover: r.cover, newState: { seq, chain }, seq, blobBytes: blob.length, payloadBits: framed.bitLength };
+  }
+  async function decodeMessage(source, password, cover, conversationId, state, bucketWidth) {
+    const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
+    const blob = unframePayload(dec.bytes, dec.bitLength);
+    const pt = await openSiv(password, blob, convAad(conversationId), cryptoParams());
+    const header = parseHeader(pt);
+    const base = state ?? { seq: 0, chain: await genesisChain(conversationId) };
+    const status = verifyChain(base, header);
+    const chain = await nextChain(header.prevChain, blob);
+    return { secret: header.body, status, newState: { seq: header.seq, chain } };
+  }
   var MockLogitSource = class {
     constructor(vocab = 256) {
       __publicField(this, "vocabSize");
@@ -901,6 +982,10 @@ var ChaffCoreNS = (() => {
   var ChaffCore = {
     encodeSecret,
     decodeSecret,
+    encodeMessage,
+    decodeMessage,
+    genesisChain,
+    describeStatus,
     asyncEncode,
     asyncDecode,
     planStep,

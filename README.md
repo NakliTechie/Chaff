@@ -127,6 +127,7 @@ src/
   fixedpoint.ts           integer fixed-point softmax (mandate #2)
   pins.ts                 pins loader + model-identity assertion
   pipeline.ts             secret ⇄ cover (AEAD + frame + codec)
+  conversation.ts         message chaining (seq + chain, tamper/drop/reorder detection)
   state.ts                state-file writer
   verify.ts               `npm run verify` — the gate orchestrator
   inference/
@@ -137,8 +138,9 @@ src/
     coder.ts              rank-bucket coder + per-step trace (mandate #3)
     sweep.ts              bucket-width / capacity knee sweep (G4)
   crypto/
-    aead.ts               PBKDF2≥600k → AES-256-GCM (portable WebCrypto)
-    vectors.ts            boot KAT self-test (G3)
+    aead.ts               PBKDF2≥600k → AES-256-SIV (msgs) / AES-256-GCM (at-rest)
+    aes-siv.ts            clean-room AES-SIV (RFC 5297) on WebCrypto primitives
+    vectors.ts            boot KAT self-test (G3): PBKDF2 / GCM / CMAC / SIV
   harness/
     roundtrip.ts          100/100 round-trip runner (G1)
     localizer.ts          causal-stage divergence localizer
@@ -152,10 +154,20 @@ scripts/                  build-browser, parity, bundle-check
 state/m0.json             last run's verdict, pins, knee, tried-trail
 ```
 
-## Crypto stack (M0)
+## Crypto stack
 
-PBKDF2-SHA256 (≥600k) → AES-256-GCM. Fails closed via the GCM tag. AES-SIV
-(nonce-misuse resistant) and Argon2id are the M2+ upgrades per the roadmap.
+PBKDF2-SHA256 (≥600k) → **AES-256-SIV** (RFC 5297, nonce-misuse resistant) for
+messages; **AES-256-GCM** for at-rest conversation state. Fails closed. AES-SIV
+is a clean-room implementation on WebCrypto primitives (CMAC + S2V + AES-CTR),
+verified against the RFC 4493 and RFC 5297 known-answer vectors at boot (G3).
+Argon2id is a future upgrade.
+
+**Conversations (message chaining).** Naming a conversation links its messages
+into a single ordered, authenticated chain (`src/conversation.ts`): each message
+carries an AEAD-authenticated `[seq, prevChain]` header, so tampering, dropped
+messages, reordering, and replays are detected. Chain state is stored per
+conversation, encrypted at rest under the password. Leave the conversation blank
+for a stateless one-off message.
 
 ## Non-goals (M0)
 

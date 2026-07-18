@@ -168,6 +168,10 @@
     <label for="pass">Shared password</label>
     <input id="pass" type="password" autocomplete="off" placeholder="a phrase you and your recipient agreed on" />
     <p class="hint">Both people enter the same password. Agree on it through a separate, trusted channel.</p>
+    <label for="conv">Conversation <span style="text-transform:none;letter-spacing:0;opacity:.7">— optional</span></label>
+    <input id="conv" type="text" autocomplete="off" placeholder="leave blank for a one-off message" />
+    <p class="hint">Name a conversation (both use the same name) to <b>chain</b> messages, so tampering, dropped
+      messages, and reordering are detected. Blank = a single stateless message.</p>
   </div>
 
   <div class="tabs" role="tablist">
@@ -211,6 +215,12 @@
         <button id="stCodec" class="ghost">Run built-in self-test</button>
         <span class="status" id="stStat"></span>
       </div>
+      <div class="row mt">
+        <button id="resetConv" class="ghost">Reset current conversation</button>
+        <span class="status" id="resetStat"></span>
+      </div>
+      <p class="hint">Clears the saved chain state for the conversation named above (on this device). Use it if a
+        conversation desyncs and you both want to start its chain over.</p>
       <div class="status" id="stOut" style="margin-top:10px">Checks the encryption and coding core end-to-end with a
         built-in model — no download needed.</div>
     </div>
@@ -219,7 +229,7 @@
   <div class="foot">
     Runs small language models in your browser via
     <a href="https://github.com/huggingface/transformers.js">transformers.js</a> (ONNX / WASM).
-    Encryption: PBKDF2 → AES-256-GCM. Open source, AGPL-3.0.
+    Encryption: PBKDF2 (600k) → AES-256-SIV (RFC 5297). Open source, AGPL-3.0.
   </div>
 </div>
 
@@ -244,9 +254,15 @@
         <li><b>Reveal:</b> paste the cover text you received and press Reveal.</li>
       </ol>
 
+      <h4>Conversations (optional)</h4>
+      <p>Leave <b>Conversation</b> blank for a one-off message. Give it a name — both people use the same one — to
+        <b>chain</b> a back-and-forth: each reveal is numbered, and Chaff flags a tampered, dropped, reordered, or
+        replayed message. The chain state lives on your device, encrypted under your password. If it ever desyncs,
+        both of you can Reset the conversation (under Advanced) to start its chain over.</p>
+
       <h4>Tips</h4>
       <ul>
-        <li>Both sides must use the <b>same model</b>, the <b>same password</b>, and the <b>same bucket width</b> (under Advanced).</li>
+        <li>Both sides must use the <b>same model</b>, the <b>same password</b>, and the <b>same bucket width</b> (under Advanced). In a conversation, the <b>same conversation name</b> too.</li>
         <li>If a reveal fails, regenerate the cover text, or nudge bucket width up a notch on both sides.</li>
         <li>Paste as plain text — apps that auto-format or “smarten” quotes can alter the cover.</li>
         <li>The built-in self-test (Advanced) confirms the core works without downloading the model.</li>
@@ -293,7 +309,9 @@ var ChaffCoreNS = (() => {
   __export(entry_exports, {
     ChaffCore: () => ChaffCore,
     MockLogitSource: () => MockLogitSource,
+    decodeMessage: () => decodeMessage,
     decodeSecret: () => decodeSecret,
+    encodeMessage: () => encodeMessage,
     encodeSecret: () => encodeSecret
   });
 
@@ -923,6 +941,59 @@ var ChaffCoreNS = (() => {
     }
   };
 
+  // src/conversation.ts
+  var CHAIN_LEN = 16;
+  var HEADER_LEN = 1 + 4 + CHAIN_LEN;
+  var VERSION = 1;
+  function bufOf(u) {
+    return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+  }
+  async function sha256(data) {
+    return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bufOf(data)));
+  }
+  async function genesisChain(conversationId) {
+    const h = await sha256(new TextEncoder().encode("chaff-chain-v1:" + conversationId));
+    return h.slice(0, CHAIN_LEN);
+  }
+  async function nextChain(prev, blob) {
+    const cat = new Uint8Array(prev.length + blob.length);
+    cat.set(prev, 0);
+    cat.set(blob, prev.length);
+    return (await sha256(cat)).slice(0, CHAIN_LEN);
+  }
+  function buildHeader(seq, prevChain) {
+    const h = new Uint8Array(HEADER_LEN);
+    h[0] = VERSION;
+    new DataView(h.buffer).setUint32(1, seq >>> 0, false);
+    h.set(prevChain.subarray(0, CHAIN_LEN), 5);
+    return h;
+  }
+  function parseHeader(pt) {
+    if (pt.length < HEADER_LEN || pt[0] !== VERSION) throw new Error("bad conversation header");
+    const seq = new DataView(pt.buffer, pt.byteOffset, pt.byteLength).getUint32(1, false);
+    return { seq, prevChain: pt.slice(5, 5 + CHAIN_LEN), body: pt.slice(HEADER_LEN) };
+  }
+  function bytesEq(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  function verifyChain(state, header) {
+    const warnings = [];
+    if (!bytesEq(header.prevChain, state.chain)) warnings.push("chain-mismatch");
+    if (header.seq <= state.seq) warnings.push("reorder-or-replay");
+    else if (header.seq > state.seq + 1) warnings.push("missing-message");
+    return { seq: header.seq, ok: warnings.length === 0, warnings };
+  }
+  function describeStatus(s) {
+    if (s.ok) return `message #${s.seq} \xB7 chain intact`;
+    const parts = [];
+    if (s.warnings.includes("missing-message")) parts.push("a message may be missing before this one");
+    if (s.warnings.includes("reorder-or-replay")) parts.push("out of order or replayed");
+    if (s.warnings.includes("chain-mismatch")) parts.push("chain broken (tampering, a drop, or a desync)");
+    return `message #${s.seq} \xB7 ${parts.join("; ")}`;
+  }
+
   // src/browser/entry.ts
   var pins = pins_default;
   function hashOf(a) {
@@ -1022,6 +1093,32 @@ var ChaffCoreNS = (() => {
     const secret = await openSiv(password, blob, aad, cryptoParams());
     return { secret, trace: dec.trace };
   }
+  function convAad(conversationId) {
+    return new TextEncoder().encode(pins.payload.magic + ":" + conversationId);
+  }
+  async function encodeMessage(source, password, secret, conversationId, state, bucketWidth) {
+    const prevChain = state ? state.chain : await genesisChain(conversationId);
+    const seq = (state ? state.seq : 0) + 1;
+    const header = buildHeader(seq, prevChain);
+    const pt = new Uint8Array(header.length + secret.length);
+    pt.set(header, 0);
+    pt.set(secret, header.length);
+    const blob = await sealSiv(password, pt, convAad(conversationId), cryptoParams());
+    const framed = framePayload(blob);
+    const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
+    const chain = await nextChain(prevChain, blob);
+    return { cover: r.cover, newState: { seq, chain }, seq, blobBytes: blob.length, payloadBits: framed.bitLength };
+  }
+  async function decodeMessage(source, password, cover, conversationId, state, bucketWidth) {
+    const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
+    const blob = unframePayload(dec.bytes, dec.bitLength);
+    const pt = await openSiv(password, blob, convAad(conversationId), cryptoParams());
+    const header = parseHeader(pt);
+    const base = state ?? { seq: 0, chain: await genesisChain(conversationId) };
+    const status = verifyChain(base, header);
+    const chain = await nextChain(header.prevChain, blob);
+    return { secret: header.body, status, newState: { seq: header.seq, chain } };
+  }
   var MockLogitSource = class {
     constructor(vocab = 256) {
       __publicField(this, "vocabSize");
@@ -1041,6 +1138,10 @@ var ChaffCoreNS = (() => {
   var ChaffCore = {
     encodeSecret,
     decodeSecret,
+    encodeMessage,
+    decodeMessage,
+    genesisChain,
+    describeStatus,
     asyncEncode,
     asyncDecode,
     planStep,
@@ -1167,6 +1268,24 @@ function blobToTokens(str){
 }
 const looksLikeBlob = (s)=> s.trim().startsWith("chaff:");
 
+// conversation state — persisted per conversation, encrypted at rest (AES-GCM) under the password
+const convId = () => $("conv").value.trim();
+const convStoreKey = (id) => "chaff:conv:" + id;
+const hexOf = (u) => [...u].map(b=>b.toString(16).padStart(2,"0")).join("");
+const bytesOfHex = (h) => Uint8Array.from(h.match(/../g)||[], x=>parseInt(x,16));
+async function loadConvState(id, pw){
+  const raw = localStorage.getItem(convStoreKey(id));
+  if(!raw) return null;
+  const pt = await Core.open(pw, bytesOfHex(raw), new TextEncoder().encode(id)); // throws on wrong password
+  const j = JSON.parse(new TextDecoder().decode(pt));
+  return { seq: j.seq, chain: bytesOfHex(j.chain) };
+}
+async function saveConvState(id, pw, state){
+  const j = JSON.stringify({ seq: state.seq, chain: hexOf(state.chain) });
+  const blob = await Core.seal(pw, new TextEncoder().encode(j), new TextEncoder().encode(id));
+  localStorage.setItem(convStoreKey(id), hexOf(blob));
+}
+
 function setModelReady(){
   ready=true; $("modelPillText").textContent=modelName(currentModel())+" ready"; $("modelPill").classList.remove("err");
   $("modelPill").classList.add("on"); $("prog").classList.add("hidden"); $("loadHint").textContent="";
@@ -1200,28 +1319,32 @@ $("genBtn").addEventListener("click", async ()=>{
   if(!$("pass").value){ $("genStat").textContent="Enter a shared password first."; return; }
   $("genBtn").disabled=true; $("copyBtn").disabled=true; $("genStat").textContent="Generating…";
   $("coverOut").classList.add("empty"); $("coverOut").textContent="Working…";
-  const pw=$("pass").value, W=bucketWidth();
+  const pw=$("pass").value, W=bucketWidth(), cid=convId();
   try{
+    let baseState=null;
+    if(cid){ try{ baseState = await loadConvState(cid, pw); }catch(e){ throw new Error(`wrong password for conversation “${cid}”`); } }
+    const oneShot = async () => cid
+      ? await Core.encodeMessage(source, pw, secret, cid, baseState, W)
+      : await Core.encodeSecret(source, pw, secret, W);
     let done=null;
     for(let attempt=0; attempt<6 && !done; attempt++){
-      const enc = await Core.encodeSecret(source, pw, secret, W);
-      const text = tokenizer.decode(enc.cover, { skip_special_tokens:true });
+      const out = await oneShot();
+      const text = tokenizer.decode(out.cover, { skip_special_tokens:true });
       const reids = tokenizer.encode(text, { add_special_tokens:false });
-      if(idsEq(reids, enc.cover)){
-        const dec = await Core.decodeSecret(source, pw, reids, W);
-        if(bytesEq(dec.secret, secret)) done={ text, cover:enc.cover, bits:enc.payloadBits };
-      }
+      if(idsEq(reids, out.cover)) done={ text, cover:out.cover, seq:out.seq, newState:out.newState };
     }
     if(done){
+      if(cid) await saveConvState(cid, pw, done.newState);
       $("coverOut").classList.remove("empty","mono"); $("coverOut").textContent=done.text;
       $("copyBtn").dataset.val=done.text; $("copyBtn").disabled=false;
-      $("genStat").innerHTML=`<span class="ok">Ready to send.</span>`;
+      $("genStat").innerHTML = cid ? `<span class="ok">Message #${done.seq} ready to send.</span>` : `<span class="ok">Ready to send.</span>`;
     } else {
-      const enc = await Core.encodeSecret(source, pw, secret, W);
-      const blob = tokensToBlob(enc.cover);
+      const out = await oneShot();
+      if(cid) await saveConvState(cid, pw, out.newState);
+      const blob = tokensToBlob(out.cover);
       $("coverOut").classList.remove("empty"); $("coverOut").classList.add("mono"); $("coverOut").textContent=blob;
       $("copyBtn").dataset.val=blob; $("copyBtn").disabled=false;
-      $("genStat").innerHTML=`Sent as a compact code this time — the natural-text version didn’t come out cleanly. Regenerate for readable cover.`;
+      $("genStat").innerHTML=`Sent as a compact code this time — the natural-text version didn’t come out cleanly. Regenerate for readable cover.`+(cid?` (message #${out.seq})`:``);
     }
   }catch(e){ $("genStat").innerHTML=`<span class="warn">Something went wrong.</span> ${escapeHtml(e?.message||String(e))}`;
     $("coverOut").textContent="—"; }
@@ -1237,18 +1360,35 @@ $("revBtn").addEventListener("click", async ()=>{
   if(!$("coverIn").value.trim()){ $("revStat").textContent="Paste the cover text first."; return; }
   $("revBtn").disabled=true; $("revStat").textContent="Revealing…";
   $("secretOut").classList.add("empty"); $("secretOut").textContent="Working…";
-  const pw=$("pass").value, W=bucketWidth(), input=$("coverIn").value;
+  const pw=$("pass").value, W=bucketWidth(), input=$("coverIn").value, cid=convId();
   try{
     const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input.trim(), { add_special_tokens:false });
-    const dec = await Core.decodeSecret(source, pw, cover, W);
-    $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(dec.secret);
-    $("revStat").innerHTML=`<span class="ok">Revealed.</span>`;
+    if(cid){
+      let baseState=null;
+      try{ baseState = await loadConvState(cid, pw); }catch(e){ throw new Error(`wrong password for conversation “${cid}”`); }
+      const r = await Core.decodeMessage(source, pw, cover, cid, baseState, W);
+      await saveConvState(cid, pw, r.newState);
+      $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(r.secret);
+      const desc = escapeHtml(Core.describeStatus(r.status));
+      $("revStat").innerHTML = r.status.ok ? `<span class="ok">Revealed · ${desc}</span>` : `<span class="warn">Revealed · ${desc}</span>`;
+    } else {
+      const dec = await Core.decodeSecret(source, pw, cover, W);
+      $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(dec.secret);
+      $("revStat").innerHTML=`<span class="ok">Revealed.</span>`;
+    }
   }catch(e){
     $("secretOut").classList.remove("empty");
-    $("secretOut").innerHTML=`<span class="warn">Couldn’t reveal this.</span> Check the password and bucket width match the sender’s, and that the text wasn’t altered in transit.`;
+    $("secretOut").innerHTML=`<span class="warn">Couldn’t reveal this.</span> Check the password${convId()?", conversation name,":""} and bucket width match the sender’s, and that the text wasn’t altered in transit.`;
     $("revStat").textContent="";
   }
   $("revBtn").disabled=false;
+});
+
+$("resetConv").addEventListener("click", ()=>{
+  const cid=convId();
+  if(!cid){ $("resetStat").textContent="Name a conversation above first."; return; }
+  localStorage.removeItem(convStoreKey(cid));
+  $("resetStat").innerHTML=`<span class="ok">Reset “${escapeHtml(cid)}”.</span>`;
 });
 
 $("stCodec").addEventListener("click", async ()=>{

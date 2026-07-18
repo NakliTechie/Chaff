@@ -17,6 +17,10 @@ import { BitReader, BitWriter } from "../util/bits.js";
 import { seal, open, sealSiv, openSiv, type CryptoParams } from "../crypto/aead.js";
 import { localize } from "../harness/localizer.js";
 import { SplitMix64 } from "../util/prng.js";
+import {
+  buildHeader, parseHeader, genesisChain, nextChain, verifyChain, describeStatus,
+  type ConvState, type ChainStatus,
+} from "../conversation.js";
 
 const pins = pinsJson as unknown as {
   codec: { logitScale: number; bucketWidth: number; maxBitsPerStep: number; softmaxPrecBits: number };
@@ -180,6 +184,68 @@ export async function decodeSecret(
   return { secret, trace: dec.trace };
 }
 
+// --- Conversation mode: message chaining over the same codec + AEAD. ---
+
+function convAad(conversationId: string): Uint8Array {
+  return new TextEncoder().encode(pins.payload.magic + ":" + conversationId);
+}
+
+export interface EncodeMessageOut {
+  cover: number[];
+  newState: ConvState;
+  seq: number;
+  blobBytes: number;
+  payloadBits: number;
+}
+
+/** Hide a secret as message `state.seq+1` in a conversation, advancing the chain. */
+export async function encodeMessage(
+  source: AsyncLogitSource,
+  password: string,
+  secret: Uint8Array,
+  conversationId: string,
+  state: ConvState | null,
+  bucketWidth?: number,
+): Promise<EncodeMessageOut> {
+  const prevChain = state ? state.chain : await genesisChain(conversationId);
+  const seq = (state ? state.seq : 0) + 1;
+  const header = buildHeader(seq, prevChain);
+  const pt = new Uint8Array(header.length + secret.length);
+  pt.set(header, 0);
+  pt.set(secret, header.length);
+  const blob = await sealSiv(password, pt, convAad(conversationId), cryptoParams());
+  const framed = framePayload(blob);
+  const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
+  const chain = await nextChain(prevChain, blob);
+  return { cover: r.cover, newState: { seq, chain }, seq, blobBytes: blob.length, payloadBits: framed.bitLength };
+}
+
+export interface DecodeMessageOut {
+  secret: Uint8Array;
+  status: ChainStatus;
+  newState: ConvState;
+}
+
+/** Reveal a conversation message, checking the chain and advancing (re-syncs on gaps). */
+export async function decodeMessage(
+  source: AsyncLogitSource,
+  password: string,
+  cover: number[],
+  conversationId: string,
+  state: ConvState | null,
+  bucketWidth?: number,
+): Promise<DecodeMessageOut> {
+  const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
+  const blob = unframePayload(dec.bytes, dec.bitLength);
+  const pt = await openSiv(password, blob, convAad(conversationId), cryptoParams());
+  const header = parseHeader(pt);
+  const base: ConvState = state ?? { seq: 0, chain: await genesisChain(conversationId) };
+  const status = verifyChain(base, header);
+  // Advance using the sender's prevChain so a receiver re-syncs after a gap.
+  const chain = await nextChain(header.prevChain, blob);
+  return { secret: header.body, status, newState: { seq: header.seq, chain } };
+}
+
 /**
  * Deterministic mock logit source — lets the tester prove the codec + crypto
  * round-trip OFFLINE (no GPT-2 download) with the same code path. Peaked,
@@ -206,6 +272,10 @@ export class MockLogitSource implements LogitSource {
 export const ChaffCore = {
   encodeSecret,
   decodeSecret,
+  encodeMessage,
+  decodeMessage,
+  genesisChain,
+  describeStatus,
   asyncEncode,
   asyncDecode,
   planStep,
