@@ -63,6 +63,23 @@ and is looking for it. Security rests on the adversary lacking (a) the shared
 secret and (b) suspicion strong enough to run a matched-model detector. Anyone
 who ships the overclaim endangers the user.
 
+**No visible ciphertext.** Chaff never falls back to sending a base64 `chaff:`
+blob dressed as cover — that would announce "there's a hidden message here" and
+defeat the point. If a message can't be turned into clean cover text (the
+tokenizer won't round-trip it after retries), the app **fails honestly** and
+sends nothing.
+
+**Cover coder + the same-runtime assumption.** Cover text comes from an entropy
+coder (Huffman over the model's top-K candidates, `src/codec/entropy.ts`) that
+codes near the model's own entropy, so tokens are selected in proportion to
+model probability and read as natural continuation of a shared, never-sent
+conversational prompt. This assumes **both peers run the same model + runtime**
+(same-arch): the coder is reversible only when both sides compute the identical
+candidate distribution. That is the deliberate trade — the earlier rank-bucket
+coder bought cross-architecture robustness (gate G2) at the cost of long,
+low-capacity cover; the entropy coder buys short, natural cover at the cost of
+requiring matched runtimes.
+
 ## Quick start
 
 ```bash

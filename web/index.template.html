@@ -207,10 +207,10 @@
   <details class="adv">
     <summary>Advanced</summary>
     <div class="card" style="margin-top:10px">
-      <label for="bw">Robustness ↔ capacity (bucket width) — <span id="bwVal" class="mono"></span></label>
-      <div class="range"><input id="bw" type="range" min="128" max="2048" step="64" /></div>
-      <p class="hint">Higher = more resilient to differences between devices, fewer bits per word. Both people must use
-        the same value. Leave at the default unless a reveal fails.</p>
+      <label for="bw" style="display:none">Robustness ↔ capacity (bucket width) — <span id="bwVal" class="mono"></span></label>
+      <div class="range" style="display:none"><input id="bw" type="range" min="128" max="2048" step="64" /></div>
+      <p class="hint">Cover text is coded near the model’s own entropy, so both people just need the
+        <b>same model</b> and the <b>same password</b> (and, in a conversation, the same conversation name).</p>
       <div class="row mt">
         <button id="stCodec" class="ghost">Run built-in self-test</button>
         <span class="status" id="stStat"></span>
@@ -262,8 +262,8 @@
 
       <h4>Tips</h4>
       <ul>
-        <li>Both sides must use the <b>same model</b>, the <b>same password</b>, and the <b>same bucket width</b> (under Advanced). In a conversation, the <b>same conversation name</b> too.</li>
-        <li>If a reveal fails, regenerate the cover text, or nudge bucket width up a notch on both sides.</li>
+        <li>Both sides must use the <b>same model</b> and the <b>same password</b>. In a conversation, the <b>same conversation name</b> too.</li>
+        <li>If a reveal fails, regenerate the cover text and resend — a fresh generation usually round-trips cleanly.</li>
         <li>Paste as plain text — apps that auto-format or “smarten” quotes can alter the cover.</li>
         <li>The built-in self-test (Advanced) confirms the core works without downloading the model.</li>
       </ul>
@@ -310,6 +310,13 @@ const MODELS = [
   { id:"onnx-community/gemma-3-1b-it-ONNX",    label:"Gemma 3 · 1B",                      dtype:"q4",   size:"~1 GB" },
 ];
 let tokenizer = null, model = null, VOCAB = 50257, ready = false, startTok = 50256;
+
+// Shared conversational prompt (both peers, pinned). It is NEVER sent — it only
+// biases the model so the cover text reads like a casual message continuation.
+// The cover carried on the wire is the continuation only, so the prompt costs no
+// transmitted length. Change it and old messages won't decode.
+const CHAFF_PROMPT = "Hey! Just wanted to send you a quick note — ";
+let promptTokens = [];
 
 const bw = $("bw"); bw.value = String(pins.codec.bucketWidth);
 const setBwLabel = () => $("bwVal").textContent = bw.value + (Number(bw.value)===pins.codec.bucketWidth ? " · default" : "");
@@ -380,7 +387,8 @@ const source = {
     return n ? past : null;
   },
   async logits(prefix) {
-    const full = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
+    const full = startTok!=null ? [startTok, ...promptTokens, ...prefix]
+      : (promptTokens.length ? [...promptTokens, ...prefix] : (prefix.length ? prefix : [0]));
     const past = (!this._noCache && this._prevOut && this._ids.length > 0
       && this._ids.length < full.length && this._ids.every((x,i)=>x===full[i]))
       ? this._pastFrom(this._prevOut) : null;
@@ -457,6 +465,7 @@ $("loadBtn").addEventListener("click", async ()=>{
     tokenizer = await TF.AutoTokenizer.from_pretrained(m.id, { progress_callback:onprog });
     model = await TF.AutoModelForCausalLM.from_pretrained(m.id, { dtype:m.dtype, device:"wasm", progress_callback:onprog });
     startTok = tokenizer.bos_token_id ?? tokenizer.eos_token_id ?? null;
+    promptTokens = tokenizer.encode(CHAFF_PROMPT, { add_special_tokens:false });
     const probe = await source.logits([]); VOCAB=probe.length; source.vocabSize=VOCAB;
     $("loadStat").textContent=""; setModelReady();
   }catch(e){
@@ -537,7 +546,7 @@ $("revBtn").addEventListener("click", async ()=>{
     }
   }catch(e){
     $("secretOut").classList.remove("empty");
-    $("secretOut").innerHTML=`<span class="warn">Couldn’t reveal this.</span> Check the password${convId()?", conversation name,":""} and bucket width match the sender’s, and that the text wasn’t altered in transit.`;
+    $("secretOut").innerHTML=`<span class="warn">Couldn’t reveal this.</span> Check the password${convId()?", conversation name,":""} and model match the sender’s, and that the text wasn’t altered in transit.`;
     $("revStat").textContent="";
   }
   $("revBtn").disabled=false;
