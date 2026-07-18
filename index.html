@@ -43,12 +43,13 @@
 
   label { display:block; font-size:12.5px; color:var(--muted); margin:14px 0 6px; }
   label:first-child { margin-top:0; }
-  textarea, input[type=text], input[type=password] {
+  textarea, input[type=text], input[type=password], select {
     width:100%; background:var(--panel2); color:var(--fg); border:1px solid var(--border);
     border-radius:10px; padding:11px 12px; font-size:14.5px; line-height:1.55; resize:vertical;
     transition:border-color .15s, box-shadow .15s; font-family:inherit; }
   textarea { min-height:84px; }
-  textarea:focus, input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  select { flex:1; min-width:0; cursor:pointer; resize:none; }
+  textarea:focus, input:focus, select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 
   button { font:inherit; font-weight:600; font-size:14px; cursor:pointer; border-radius:10px;
@@ -152,16 +153,18 @@
   </header>
 
   <div class="card">
+    <label for="modelSel">Model — both people must pick the same one</label>
     <div class="row">
-      <span id="modelPill" class="chip"><span class="dot"></span><span id="modelPillText">Model not loaded</span></span>
-      <span class="spacer"></span>
-      <button id="loadBtn" class="ghost">Load model</button>
+      <select id="modelSel"></select>
+      <button id="loadBtn" class="ghost">Load</button>
     </div>
-    <div class="row mt hidden" id="loadRow">
-      <progress id="prog" max="100" value="0"></progress>
+    <div class="row mt">
+      <span id="modelPill" class="chip"><span class="dot"></span><span id="modelPillText">Not loaded</span></span>
+      <span class="spacer"></span>
+      <progress id="prog" class="hidden" max="100" value="0"></progress>
       <span class="status" id="loadStat"></span>
     </div>
-    <p class="hint" id="loadHint">First load downloads GPT-2 once (a few hundred MB), then it’s cached and runs offline.</p>
+    <p class="hint" id="loadHint"></p>
     <label for="pass">Shared password</label>
     <input id="pass" type="password" autocomplete="off" placeholder="a phrase you and your recipient agreed on" />
     <p class="hint">Both people enter the same password. Agree on it through a separate, trusted channel.</p>
@@ -214,8 +217,8 @@
   </details>
 
   <div class="foot">
-    Runs <a href="https://huggingface.co/Xenova/gpt2">GPT-2</a> in your browser via
-    <a href="https://github.com/huggingface/transformers.js">transformers.js</a> (WASM, fp32, single-thread).
+    Runs small language models in your browser via
+    <a href="https://github.com/huggingface/transformers.js">transformers.js</a> (ONNX / WASM).
     Encryption: PBKDF2 → AES-256-GCM. Open source, AGPL-3.0.
   </div>
 </div>
@@ -243,7 +246,7 @@
 
       <h4>Tips</h4>
       <ul>
-        <li>Both sides must use the <b>same password</b> and the <b>same bucket width</b> (under Advanced).</li>
+        <li>Both sides must use the <b>same model</b>, the <b>same password</b>, and the <b>same bucket width</b> (under Advanced).</li>
         <li>If a reveal fails, regenerate the cover text, or nudge bucket width up a notch on both sides.</li>
         <li>Paste as plain text — apps that auto-format or “smarten” quotes can alter the cover.</li>
         <li>The built-in self-test (Advanced) confirms the core works without downloading the model.</li>
@@ -255,7 +258,7 @@
         steganography can detect it statistically. Your safety rests on the password staying secret and
         on not being individually targeted by a matched-model detector. Treat it as cover, not a guarantee.</p>
 
-      <p class="modal-foot">Open source, AGPL-3.0 · runs GPT-2 locally via transformers.js.</p>
+      <p class="modal-foot">Open source, AGPL-3.0 · runs small language models locally via transformers.js.</p>
     </div>
   </div>
 </div>
@@ -921,13 +924,43 @@ const Core = window.ChaffCore;
 const pins = Core.pins;
 const $ = (id) => document.getElementById(id);
 
-const EOT = 50256;
-let tokenizer = null, model = null, VOCAB = 50257, ready = false;
+// Model registry — all run in-browser via transformers.js (ONNX). Both ends
+// must use the SAME model + dtype for a message to round-trip. GPT-2 (fp32) is
+// the default because its cross-device determinism is the one that's been
+// verified; the larger/quantized models give nicer prose but are less battle-
+// tested for cross-device round-trips (keep the bucket width matched, and nudge
+// it up under Advanced if a reveal fails).
+const MODELS = [
+  { id:"Xenova/gpt2",                          label:"GPT-2 · 124M (default)",            dtype:"fp32", size:"~500 MB" },
+  { id:"Xenova/distilgpt2",                    label:"DistilGPT-2 · 82M (fastest)",       dtype:"fp32", size:"~350 MB" },
+  { id:"Xenova/gpt2-medium",                   label:"GPT-2 Medium · 355M",               dtype:"fp32", size:"~1.4 GB" },
+  { id:"onnx-community/SmolLM2-360M-Instruct", label:"SmolLM2 · 360M",                    dtype:"q8",   size:"~400 MB" },
+  { id:"onnx-community/Qwen2.5-0.5B-Instruct", label:"Qwen2.5 · 0.5B",                    dtype:"q8",   size:"~600 MB" },
+  { id:"onnx-community/Llama-3.2-1B-Instruct", label:"Llama 3.2 · 1B",                    dtype:"q4",   size:"~1 GB" },
+  { id:"onnx-community/gemma-3-1b-it-ONNX",    label:"Gemma 3 · 1B",                      dtype:"q4",   size:"~1 GB" },
+];
+let tokenizer = null, model = null, VOCAB = 50257, ready = false, startTok = 50256;
 
 const bw = $("bw"); bw.value = String(pins.codec.bucketWidth);
 const setBwLabel = () => $("bwVal").textContent = bw.value + (Number(bw.value)===pins.codec.bucketWidth ? " · default" : "");
 setBwLabel(); bw.addEventListener("input", setBwLabel);
 const bucketWidth = () => Number(bw.value);
+
+// model picker
+const modelSel = $("modelSel");
+MODELS.forEach((m,i)=>{ const o=document.createElement("option"); o.value=String(i); o.textContent=m.label; modelSel.appendChild(o); });
+const currentModel = () => MODELS[Number(modelSel.value)] || MODELS[0];
+const modelName = (m) => m.label.split(" ·")[0];
+function updateLoadHint(){ const m=currentModel();
+  $("loadHint").textContent = ready ? "" : `First load downloads ${modelName(m)} (${m.size}) once, then it’s cached and runs offline.`; }
+modelSel.addEventListener("change", ()=>{
+  if(ready || tokenizer){ ready=false; tokenizer=null; model=null;
+    $("genBtn").disabled=true; $("revBtn").disabled=true;
+    $("modelPillText").textContent="Not loaded"; $("modelPill").classList.remove("on","err");
+    $("loadBtn").classList.remove("hidden"); $("loadBtn").disabled=false; }
+  updateLoadHint();
+});
+updateLoadHint();
 
 function selectTab(which){
   const enc = which === "enc";
@@ -950,10 +983,13 @@ let toastTimer = null;
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"), 1400); }
 
-const gpt2 = {
-  vocabSize: VOCAB, id: "Xenova/gpt2", weightHash: "onnx-fp32",
+// Generic causal-LM logit source — works for any transformers.js model. Seeds
+// context with the tokenizer's start token so both ends feed an identical prefix.
+const source = {
+  vocabSize: VOCAB, id: "model", weightHash: "onnx",
   async logits(prefix) {
-    const ids = [EOT, ...prefix]; const n = ids.length;
+    const ids = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
+    const n = ids.length;
     const input_ids = new TF.Tensor("int64", BigInt64Array.from(ids.map((x)=>BigInt(x))), [1, n]);
     const attention_mask = new TF.Tensor("int64", BigInt64Array.from(ids.map(()=>1n)), [1, n]);
     const out = await model({ input_ids, attention_mask });
@@ -980,25 +1016,28 @@ function blobToTokens(str){
 const looksLikeBlob = (s)=> s.trim().startsWith("chaff:");
 
 function setModelReady(){
-  ready=true; $("modelPillText").textContent="Model ready"; $("modelPill").classList.remove("err");
-  $("modelPill").classList.add("on"); $("loadRow").classList.add("hidden"); $("loadHint").classList.add("hidden");
+  ready=true; $("modelPillText").textContent=modelName(currentModel())+" ready"; $("modelPill").classList.remove("err");
+  $("modelPill").classList.add("on"); $("prog").classList.add("hidden"); $("loadHint").textContent="";
   $("loadBtn").classList.add("hidden"); $("genBtn").disabled=false; $("revBtn").disabled=false;
 }
 
 $("loadBtn").addEventListener("click", async ()=>{
-  $("loadBtn").disabled=true; $("loadRow").classList.remove("hidden"); $("modelPillText").textContent="Loading…";
+  $("loadBtn").disabled=true; $("prog").classList.remove("hidden"); $("prog").value=0;
+  $("modelPill").classList.remove("on","err"); $("modelPillText").textContent="Loading…";
   const onprog=(p)=>{ if(p&&p.progress!=null){ $("prog").value=p.progress;
     $("loadStat").textContent=(p.file? p.file.split("/").pop()+" ":"")+Math.round(p.progress)+"%"; } };
   try{
     if(!TF){ TF = await import(TF_URL); TF.env.allowLocalModels=false; TF.env.backends.onnx.wasm.numThreads=1; }
-    tokenizer = await TF.AutoTokenizer.from_pretrained("Xenova/gpt2", { progress_callback:onprog });
-    model = await TF.AutoModelForCausalLM.from_pretrained("Xenova/gpt2", { dtype:"fp32", device:"wasm", progress_callback:onprog });
-    const probe = await gpt2.logits([]); VOCAB=probe.length; gpt2.vocabSize=VOCAB;
-    setModelReady();
+    const m = currentModel();
+    tokenizer = await TF.AutoTokenizer.from_pretrained(m.id, { progress_callback:onprog });
+    model = await TF.AutoModelForCausalLM.from_pretrained(m.id, { dtype:m.dtype, device:"wasm", progress_callback:onprog });
+    startTok = tokenizer.bos_token_id ?? tokenizer.eos_token_id ?? null;
+    const probe = await source.logits([]); VOCAB=probe.length; source.vocabSize=VOCAB;
+    $("loadStat").textContent=""; setModelReady();
   }catch(e){
     $("modelPillText").textContent="Load failed"; $("modelPill").classList.add("err");
-    $("loadBtn").disabled=false; $("loadRow").classList.add("hidden");
-    $("loadHint").textContent="Couldn’t load the model — check your connection and try again.";
+    $("loadBtn").disabled=false; $("prog").classList.add("hidden"); $("loadStat").textContent="";
+    $("loadHint").textContent="Couldn’t load "+modelName(currentModel())+" — check your connection, or try another model.";
   }
 });
 
@@ -1013,11 +1052,11 @@ $("genBtn").addEventListener("click", async ()=>{
   try{
     let done=null;
     for(let attempt=0; attempt<6 && !done; attempt++){
-      const enc = await Core.encodeSecret(gpt2, pw, secret, W);
+      const enc = await Core.encodeSecret(source, pw, secret, W);
       const text = tokenizer.decode(enc.cover, { skip_special_tokens:true });
       const reids = tokenizer.encode(text, { add_special_tokens:false });
       if(idsEq(reids, enc.cover)){
-        const dec = await Core.decodeSecret(gpt2, pw, reids, W);
+        const dec = await Core.decodeSecret(source, pw, reids, W);
         if(bytesEq(dec.secret, secret)) done={ text, cover:enc.cover, bits:enc.payloadBits };
       }
     }
@@ -1026,7 +1065,7 @@ $("genBtn").addEventListener("click", async ()=>{
       $("copyBtn").dataset.val=done.text; $("copyBtn").disabled=false;
       $("genStat").innerHTML=`<span class="ok">Ready to send.</span>`;
     } else {
-      const enc = await Core.encodeSecret(gpt2, pw, secret, W);
+      const enc = await Core.encodeSecret(source, pw, secret, W);
       const blob = tokensToBlob(enc.cover);
       $("coverOut").classList.remove("empty"); $("coverOut").classList.add("mono"); $("coverOut").textContent=blob;
       $("copyBtn").dataset.val=blob; $("copyBtn").disabled=false;
@@ -1049,7 +1088,7 @@ $("revBtn").addEventListener("click", async ()=>{
   const pw=$("pass").value, W=bucketWidth(), input=$("coverIn").value;
   try{
     const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input.trim(), { add_special_tokens:false });
-    const dec = await Core.decodeSecret(gpt2, pw, cover, W);
+    const dec = await Core.decodeSecret(source, pw, cover, W);
     $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(dec.secret);
     $("revStat").innerHTML=`<span class="ok">Revealed.</span>`;
   }catch(e){
