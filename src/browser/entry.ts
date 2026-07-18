@@ -14,7 +14,7 @@ import { planStep, encode, decode, DivergenceError, type CoderConfig, type StepT
 import { fixedPointSoftmax, entropyBits } from "../fixedpoint.js";
 import { hashInts } from "../util/hash.js";
 import { BitReader, BitWriter } from "../util/bits.js";
-import { seal, open, type CryptoParams } from "../crypto/aead.js";
+import { seal, open, sealSiv, openSiv, type CryptoParams } from "../crypto/aead.js";
 import { localize } from "../harness/localizer.js";
 import { SplitMix64 } from "../util/prng.js";
 
@@ -155,7 +155,7 @@ export async function encodeSecret(
   bucketWidth?: number,
 ): Promise<EncodeOut> {
   const aad = new TextEncoder().encode(pins.payload.magic);
-  const blob = await seal(password, secret, aad, cryptoParams());
+  const blob = await sealSiv(password, secret, aad, cryptoParams());
   const framed = framePayload(blob);
   const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
   return { cover: r.cover, trace: r.trace, blobBytes: blob.length, payloadBits: framed.bitLength };
@@ -176,7 +176,7 @@ export async function decodeSecret(
   const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
   const blob = unframePayload(dec.bytes, dec.bitLength);
   const aad = new TextEncoder().encode(pins.payload.magic);
-  const secret = await open(password, blob, aad, cryptoParams());
+  const secret = await openSiv(password, blob, aad, cryptoParams());
   return { secret, trace: dec.trace };
 }
 
@@ -216,6 +216,8 @@ export const ChaffCore = {
   entropyBits,
   seal,
   open,
+  sealSiv,
+  openSiv,
   BitReader,
   BitWriter,
   DivergenceError,

@@ -13,7 +13,7 @@ import type { LogitSource } from "./inference/types.js";
 import type { Pins } from "./pins.js";
 import { BitReader, BitWriter } from "./util/bits.js";
 import { decode, encode, type CoderConfig, type StepTrace } from "./codec/coder.js";
-import { open, seal, type CryptoParams } from "./crypto/aead.js";
+import { openSiv, sealSiv, type CryptoParams } from "./crypto/aead.js";
 
 export function coderConfigFromPins(pins: Pins): CoderConfig {
   return {
@@ -63,7 +63,7 @@ export async function encodeSecret(
   seedPrefix: number[] = [],
 ): Promise<EncodeSecretResult> {
   const aad = new TextEncoder().encode(pins.payload.magic);
-  const blob = await seal(password, secret, aad, cryptoParamsFromPins(pins));
+  const blob = await sealSiv(password, secret, aad, cryptoParamsFromPins(pins));
   const framed = framePayload(blob, pins.payload.lengthFieldBits);
   const result = encode(source, framed.bytes, framed.bitLength, coderConfigFromPins(pins), seedPrefix);
   return { cover: result.cover, trace: result.trace, blobBytes: blob.length, payloadBits: framed.bitLength };
@@ -84,6 +84,6 @@ export async function decodeSecret(
   const dec = decode(source, cover, coderConfigFromPins(pins), undefined, seedPrefix);
   const blob = unframePayload(dec.bytes, dec.bitLength, pins.payload.lengthFieldBits);
   const aad = new TextEncoder().encode(pins.payload.magic);
-  const secret = await open(password, blob, aad, cryptoParamsFromPins(pins));
+  const secret = await openSiv(password, blob, aad, cryptoParamsFromPins(pins));
   return { secret, trace: dec.trace };
 }

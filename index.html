@@ -517,12 +517,12 @@ var ChaffCoreNS = (() => {
     return fnv1a(bytes).toString(16).padStart(8, "0");
   }
   function hashInts(values) {
-    const buf = new Uint8Array(values.length * 4);
-    const view = new DataView(buf.buffer);
+    const buf2 = new Uint8Array(values.length * 4);
+    const view = new DataView(buf2.buffer);
     for (let i = 0; i < values.length; i++) {
       view.setInt32(i * 4, values[i] | 0, true);
     }
-    return hashHex(buf);
+    return hashHex(buf2);
   }
 
   // src/codec/coder.ts
@@ -638,9 +638,129 @@ var ChaffCoreNS = (() => {
     return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
   }
 
+  // src/crypto/aes-siv.ts
+  var subtle = globalThis.crypto.subtle;
+  var R = 135;
+  function buf(u) {
+    return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+  }
+  function xor(a, b, n = Math.min(a.length, b.length)) {
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = a[i] ^ b[i];
+    return out;
+  }
+  function dbl(x) {
+    const out = new Uint8Array(16);
+    let carry = 0;
+    for (let i = 15; i >= 0; i--) {
+      const v = x[i] << 1 | carry;
+      out[i] = v & 255;
+      carry = x[i] & 128 ? 1 : 0;
+    }
+    if (x[0] & 128) out[15] = out[15] ^ R;
+    return out;
+  }
+  async function importCtr(key) {
+    return subtle.importKey("raw", buf(key), "AES-CTR", false, ["encrypt"]);
+  }
+  async function aesBlock(ctrKey, block) {
+    const zero = new Uint8Array(16);
+    const out = await subtle.encrypt({ name: "AES-CTR", counter: buf(block), length: 128 }, ctrKey, buf(zero));
+    return new Uint8Array(out).subarray(0, 16);
+  }
+  async function aesCtr(key, iv, data) {
+    if (data.length === 0) return new Uint8Array(0);
+    const k = await importCtr(key);
+    const out = await subtle.encrypt({ name: "AES-CTR", counter: buf(iv), length: 128 }, k, buf(data));
+    return new Uint8Array(out);
+  }
+  async function cmac(key, msg) {
+    const ck = await importCtr(key);
+    const L = await aesBlock(ck, new Uint8Array(16));
+    const K1 = dbl(L);
+    const K2 = dbl(K1);
+    const n = Math.ceil(msg.length / 16);
+    const complete = msg.length > 0 && msg.length % 16 === 0;
+    let last;
+    if (n === 0) {
+      const padded = new Uint8Array(16);
+      padded[0] = 128;
+      last = xor(padded, K2, 16);
+    } else if (complete) {
+      last = xor(msg.subarray((n - 1) * 16, n * 16), K1, 16);
+    } else {
+      const rem = msg.subarray((n - 1) * 16);
+      const padded = new Uint8Array(16);
+      padded.set(rem);
+      padded[rem.length] = 128;
+      last = xor(padded, K2, 16);
+    }
+    let x = new Uint8Array(16);
+    const blocks = Math.max(n, 1);
+    for (let i = 0; i < blocks - 1; i++) {
+      x = await aesBlock(ck, xor(x, msg.subarray(i * 16, i * 16 + 16), 16));
+    }
+    return aesBlock(ck, xor(x, last, 16));
+  }
+  async function s2v(key, ads, plaintext) {
+    const zero = new Uint8Array(16);
+    if (ads.length === 0 && plaintext.length === 0) {
+      const one = new Uint8Array(16);
+      one[15] = 1;
+      return cmac(key, one);
+    }
+    let d = await cmac(key, zero);
+    for (const ad of ads) {
+      d = xor(dbl(d), await cmac(key, ad), 16);
+    }
+    let t;
+    if (plaintext.length >= 16) {
+      t = new Uint8Array(plaintext);
+      const off = t.length - 16;
+      for (let i = 0; i < 16; i++) t[off + i] = t[off + i] ^ d[i];
+    } else {
+      const padded = new Uint8Array(16);
+      padded.set(plaintext);
+      padded[plaintext.length] = 128;
+      t = xor(dbl(d), padded, 16);
+    }
+    return cmac(key, t);
+  }
+  function sivToCtrIv(v) {
+    const q = new Uint8Array(v);
+    q[8] = q[8] & 127;
+    q[12] = q[12] & 127;
+    return q;
+  }
+  async function sivEncrypt(key, ads, plaintext) {
+    const half = key.length / 2;
+    const k1 = key.subarray(0, half);
+    const k2 = key.subarray(half);
+    const v = await s2v(k1, ads, plaintext);
+    const c = await aesCtr(k2, sivToCtrIv(v), plaintext);
+    const out = new Uint8Array(16 + c.length);
+    out.set(v, 0);
+    out.set(c, 16);
+    return out;
+  }
+  async function sivDecrypt(key, ads, input) {
+    if (input.length < 16) throw new Error("AES-SIV: input too short");
+    const half = key.length / 2;
+    const k1 = key.subarray(0, half);
+    const k2 = key.subarray(half);
+    const v = input.subarray(0, 16);
+    const c = input.subarray(16);
+    const p = await aesCtr(k2, sivToCtrIv(v), c);
+    const t = await s2v(k1, ads, p);
+    let diff = 0;
+    for (let i = 0; i < 16; i++) diff |= t[i] ^ v[i];
+    if (diff !== 0) throw new Error("AES-SIV: authentication failed");
+    return p;
+  }
+
   // src/crypto/aead.ts
   var webcrypto = globalThis.crypto;
-  var subtle = webcrypto.subtle;
+  var subtle2 = webcrypto.subtle;
   var DEFAULT_PARAMS = {
     kdfIterations: 6e5,
     saltBytes: 16,
@@ -648,10 +768,10 @@ var ChaffCoreNS = (() => {
     keyBits: 256
   };
   async function deriveKey(password, salt, params) {
-    const baseKey = await subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, [
+    const baseKey = await subtle2.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, [
       "deriveKey"
     ]);
-    return subtle.deriveKey(
+    return subtle2.deriveKey(
       { name: "PBKDF2", salt: bufferSource(salt), iterations: params.kdfIterations, hash: "SHA-256" },
       baseKey,
       { name: "AES-GCM", length: params.keyBits },
@@ -667,7 +787,7 @@ var ChaffCoreNS = (() => {
     const nonce = webcrypto.getRandomValues(new Uint8Array(params.nonceBytes));
     const key = await deriveKey(password, salt, params);
     const ct = new Uint8Array(
-      await subtle.encrypt(
+      await subtle2.encrypt(
         { name: "AES-GCM", iv: bufferSource(nonce), additionalData: bufferSource(aad) },
         key,
         bufferSource(plaintext)
@@ -685,13 +805,43 @@ var ChaffCoreNS = (() => {
     const ct = blob.slice(params.saltBytes + params.nonceBytes);
     const key = await deriveKey(password, salt, params);
     const pt = new Uint8Array(
-      await subtle.decrypt(
+      await subtle2.decrypt(
         { name: "AES-GCM", iv: bufferSource(nonce), additionalData: bufferSource(aad) },
         key,
         bufferSource(ct)
       )
     );
     return pt;
+  }
+  async function deriveSivKey(password, salt, params) {
+    return pbkdf2Sha256(new TextEncoder().encode(password), salt, params.kdfIterations, 64);
+  }
+  async function sealSiv(password, plaintext, aad, params = DEFAULT_PARAMS) {
+    const salt = webcrypto.getRandomValues(new Uint8Array(params.saltBytes));
+    const nonce = webcrypto.getRandomValues(new Uint8Array(16));
+    const key = await deriveSivKey(password, salt, params);
+    const out = await sivEncrypt(key, [aad, nonce], plaintext);
+    const blob = new Uint8Array(salt.length + nonce.length + out.length);
+    blob.set(salt, 0);
+    blob.set(nonce, salt.length);
+    blob.set(out, salt.length + nonce.length);
+    return blob;
+  }
+  async function openSiv(password, blob, aad, params = DEFAULT_PARAMS) {
+    const salt = blob.slice(0, params.saltBytes);
+    const nonce = blob.slice(params.saltBytes, params.saltBytes + 16);
+    const out = blob.slice(params.saltBytes + 16);
+    const key = await deriveSivKey(password, salt, params);
+    return sivDecrypt(key, [aad, nonce], out);
+  }
+  async function pbkdf2Sha256(password, salt, iterations, dkBytes) {
+    const baseKey = await subtle2.importKey("raw", bufferSource(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await subtle2.deriveBits(
+      { name: "PBKDF2", salt: bufferSource(salt), iterations, hash: "SHA-256" },
+      baseKey,
+      dkBytes * 8
+    );
+    return new Uint8Array(bits);
   }
 
   // src/harness/localizer.ts
@@ -860,7 +1010,7 @@ var ChaffCoreNS = (() => {
   }
   async function encodeSecret(source, password, secret, bucketWidth) {
     const aad = new TextEncoder().encode(pins.payload.magic);
-    const blob = await seal(password, secret, aad, cryptoParams());
+    const blob = await sealSiv(password, secret, aad, cryptoParams());
     const framed = framePayload(blob);
     const r = await asyncEncode(source, framed.bytes, framed.bitLength, coderConfig(bucketWidth));
     return { cover: r.cover, trace: r.trace, blobBytes: blob.length, payloadBits: framed.bitLength };
@@ -869,7 +1019,7 @@ var ChaffCoreNS = (() => {
     const dec = await asyncDecode(source, cover, coderConfig(bucketWidth));
     const blob = unframePayload(dec.bytes, dec.bitLength);
     const aad = new TextEncoder().encode(pins.payload.magic);
-    const secret = await open(password, blob, aad, cryptoParams());
+    const secret = await openSiv(password, blob, aad, cryptoParams());
     return { secret, trace: dec.trace };
   }
   var MockLogitSource = class {
@@ -901,6 +1051,8 @@ var ChaffCoreNS = (() => {
     entropyBits,
     seal,
     open,
+    sealSiv,
+    openSiv,
     BitReader,
     BitWriter,
     DivergenceError,
