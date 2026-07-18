@@ -62,17 +62,22 @@ export function fixedPointSoftmax(quantLogits: number[], cfg: SoftmaxConfig): So
   const n = quantLogits.length;
   const precBits = BigInt(cfg.softmaxPrecBits);
   const denomBig = 1n << precBits;
+  if (n === 0) return { probs: [], denom: Number(denomBig) }; // empty distribution: nothing to normalize
   const scale = BigInt(cfg.logitScale);
 
-  let maxQ = -Infinity;
-  for (let i = 0; i < n; i++) if (quantLogits[i]! > maxQ) maxQ = quantLogits[i]!;
-  const maxQBig = BigInt(Math.round(maxQ));
+  // Canonicalize inputs to int32 ONCE so the max and every element read identical
+  // integer values (no max-vs-element coercion drift for out-of-range inputs).
+  const q = new Int32Array(n);
+  for (let i = 0; i < n; i++) q[i] = Math.round(quantLogits[i]!) | 0;
+  let maxQ = q[0]!;
+  for (let i = 1; i < n; i++) if (q[i]! > maxQ) maxQ = q[i]!;
+  const maxQBig = BigInt(maxQ);
 
   // e[i] = exp((Q_i - Q_max)/scale) in Q(precBits) fixed point.
   const e: bigint[] = new Array(n);
   let sum = 0n;
   for (let i = 0; i < n; i++) {
-    const dq = BigInt(quantLogits[i]! | 0) - maxQBig; // <= 0
+    const dq = BigInt(q[i]!) - maxQBig; // <= 0
     // t = -dq/scale * log2(e) >= 0  (exponent for base-2)
     // tQ30 = (-dq) * LOG2E_Q30 / scale
     const negDq = -dq;

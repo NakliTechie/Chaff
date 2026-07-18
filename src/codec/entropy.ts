@@ -82,6 +82,10 @@ function topKByLogit(logits: Float64Array, logitScale: number, topK: number): { 
 /** Deterministic Huffman tree + code table over the top-K candidates. */
 export function buildStepModel(logits: Float64Array, cfg: CoderConfig): StepModel {
   const { ids, quant } = topKByLogit(logits, cfg.logitScale, cfg.topK ?? DEFAULT_TOP_K);
+  // The termination guarantee (each step consumes >= 1 payload bit) requires a
+  // tree with >= 2 leaves; a degenerate vocab of 1 would otherwise spin to the
+  // step cap. Enforce it here rather than relying on the invariant holding.
+  if (ids.length < 2) throw new Error("entropy coder needs a vocabulary of at least 2 tokens");
   // Integer weights ∝ probability, floored to ≥ 1 so every candidate is reachable.
   const sm = fixedPointSoftmax(quant, { logitScale: cfg.logitScale, softmaxPrecBits: cfg.softmaxPrecBits });
   let nodes: HuffNode[] = ids.map((id, i) => ({ weight: BigInt(sm.probs[i]! + 1), minId: id, token: id }));
