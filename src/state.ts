@@ -37,6 +37,7 @@ export interface ChaffState {
     modelId: string;
     weightHash: string;
     bucketWidth: number;
+    topK: number;
     logitScale: number;
     softmaxPrecBits: number;
     kdfIterations: number;

@@ -78,6 +78,8 @@ export function loadPins(): Pins {
     [pins.codec.bucketWidth > 0, "codec.bucketWidth"],
     [pins.codec.softmaxPrecBits >= 4, "codec.softmaxPrecBits"],
     [pins.codec.maxBitsPerStep >= 1, "codec.maxBitsPerStep"],
+    [pins.codec.topK === undefined || pins.codec.topK >= 2, "codec.topK>=2"], // shipped entropy coder's dial
+
     [pins.crypto.kdfIterations >= 600000, "crypto.kdfIterations>=600000"],
     [pins.crypto.keyBits === 256, "crypto.keyBits===256"],
     [pins.payload.lengthFieldBits >= 16, "payload.lengthFieldBits"],

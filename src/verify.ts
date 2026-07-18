@@ -144,6 +144,7 @@ async function main(): Promise<void> {
       modelId: lm.id,
       weightHash: lm.weightHash,
       bucketWidth: pins.codec.bucketWidth,
+      topK: pins.codec.topK ?? 128,
       logitScale: pins.codec.logitScale,
       softmaxPrecBits: pins.codec.softmaxPrecBits,
       kdfIterations: pins.crypto.kdfIterations,
