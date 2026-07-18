@@ -6,3 +6,6 @@ state/*.json
 
 # working notes (not shipped)
 plan/
+
+# autopilot worktrees
+.worktrees/
