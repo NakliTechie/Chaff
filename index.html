@@ -462,14 +462,17 @@ var ChaffCoreNS = (() => {
     const n = quantLogits.length;
     const precBits = BigInt(cfg.softmaxPrecBits);
     const denomBig = 1n << precBits;
+    if (n === 0) return { probs: [], denom: Number(denomBig) };
     const scale = BigInt(cfg.logitScale);
-    let maxQ = -Infinity;
-    for (let i = 0; i < n; i++) if (quantLogits[i] > maxQ) maxQ = quantLogits[i];
-    const maxQBig = BigInt(Math.round(maxQ));
+    const q = new Int32Array(n);
+    for (let i = 0; i < n; i++) q[i] = Math.round(quantLogits[i]) | 0;
+    let maxQ = q[0];
+    for (let i = 1; i < n; i++) if (q[i] > maxQ) maxQ = q[i];
+    const maxQBig = BigInt(maxQ);
     const e = new Array(n);
     let sum = 0n;
     for (let i = 0; i < n; i++) {
-      const dq = BigInt(quantLogits[i] | 0) - maxQBig;
+      const dq = BigInt(q[i]) - maxQBig;
       const negDq = -dq;
       const tQ30 = negDq * LOG2E_Q30 / scale;
       const iPart = tQ30 >> Q30;
@@ -498,10 +501,10 @@ var ChaffCoreNS = (() => {
     const rema = [];
     for (let i = 0; i < n; i++) {
       const scaled = e[i] * denomBig;
-      const q = scaled / sum;
-      const r = scaled - q * sum;
-      probs[i] = Number(q);
-      allocated += q;
+      const q2 = scaled / sum;
+      const r = scaled - q2 * sum;
+      probs[i] = Number(q2);
+      allocated += q2;
       rema.push({ idx: i, rem: r });
     }
     let leftover = Number(denomBig - allocated);
@@ -796,6 +799,7 @@ var ChaffCoreNS = (() => {
   }
   function buildStepModel(logits, cfg) {
     const { ids, quant } = topKByLogit(logits, cfg.logitScale, cfg.topK ?? DEFAULT_TOP_K);
+    if (ids.length < 2) throw new Error("entropy coder needs a vocabulary of at least 2 tokens");
     const sm = fixedPointSoftmax(quant, { logitScale: cfg.logitScale, softmaxPrecBits: cfg.softmaxPrecBits });
     let nodes = ids.map((id, i) => ({ weight: BigInt(sm.probs[i] + 1), minId: id, token: id }));
     while (nodes.length > 1) {
@@ -1184,6 +1188,10 @@ var ChaffCoreNS = (() => {
   function unframePayload(bits, bitLength) {
     const r = new BitReader(bits, bitLength);
     const blobLen = r.readBits(pins.payload.lengthFieldBits);
+    const maxBytes = Math.max(0, bitLength - pins.payload.lengthFieldBits >> 3);
+    if (blobLen > maxBytes) {
+      throw new Error(`frame claims ${blobLen} bytes but only ${maxBytes} decoded \u2014 corrupt cover`);
+    }
     const blob = new Uint8Array(blobLen);
     for (let i = 0; i < blobLen; i++) blob[i] = r.readBits(8);
     return blob;
@@ -1428,7 +1436,7 @@ const source = {
   _prevOut: null,   // full model output whose present.* KV covers _ids
   _ids: [],         // id sequence the cache currently covers
   _noCache: false,  // set once if incremental caching ever fails (then behaves like the original)
-  reset(){ this._prevOut = null; this._ids = []; },
+  reset(){ this._prevOut = null; this._ids = []; this._noCache = false; },
   // transformers.js returns the KV cache as raw ONNX `present.*` outputs; the model
   // consumes it as `past_key_values.*` inputs. Repack present→past for the next step.
   _pastFrom(out){
@@ -1465,14 +1473,8 @@ const source = {
   }
 };
 const idsEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
-const bytesEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
+const bytesEq = idsEq; // same elementwise-equality; kept as a name for byte arrays
 
-function tokensToBlob(cover){
-  const buf=new Uint8Array(9+cover.length*2), dv=new DataView(buf.buffer);
-  buf[0]=67;buf[1]=72;buf[2]=70;buf[3]=48; dv.setUint8(4,1); dv.setUint32(5,cover.length,true);
-  for(let i=0;i<cover.length;i++) dv.setUint16(9+i*2,cover[i],true);
-  let s=""; for(const b of buf) s+=String.fromCharCode(b); return "chaff:"+btoa(s);
-}
 function blobToTokens(str){
   const s=atob(str.replace(/^chaff:/,"").trim()); const buf=new Uint8Array(s.length);
   for(let i=0;i<s.length;i++) buf[i]=s.charCodeAt(i); const dv=new DataView(buf.buffer);
@@ -1507,6 +1509,7 @@ function setModelReady(){
 }
 
 $("loadBtn").addEventListener("click", async ()=>{
+  source.reset(); // drop any KV cache from a previously-loaded model before switching
   $("loadBtn").disabled=true; $("prog").classList.remove("hidden"); $("prog").value=0;
   $("modelPill").classList.remove("on","err"); $("modelPillText").textContent="Loading…";
   const onprog=(p)=>{ if(p&&p.progress!=null){ $("prog").value=p.progress;
