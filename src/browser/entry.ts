@@ -21,6 +21,7 @@ import {
 } from "../codec/coder.js";
 import { fixedPointSoftmax, entropyBits } from "../fixedpoint.js";
 import { hashInts } from "../util/hash.js";
+import { buildStepModel } from "../codec/entropy.js";
 import { BitReader, BitWriter } from "../util/bits.js";
 import { seal, open, sealSiv, openSiv, type CryptoParams } from "../crypto/aead.js";
 import { localize } from "../harness/localizer.js";
@@ -31,7 +32,7 @@ import {
 } from "../conversation.js";
 
 const pins = pinsJson as unknown as {
-  codec: { logitScale: number; bucketWidth: number; maxBitsPerStep: number; softmaxPrecBits: number };
+  codec: { logitScale: number; bucketWidth: number; maxBitsPerStep: number; softmaxPrecBits: number; topK?: number };
   crypto: { kdfIterations: number; saltBytes: number; nonceBytes: number; keyBits: number };
   payload: { magic: string; lengthFieldBits: number; maxSecretBytes: number };
 };
@@ -46,6 +47,7 @@ function coderConfig(bucketWidthOverride?: number): CoderConfig {
     bucketWidth: bucketWidthOverride ?? pins.codec.bucketWidth,
     maxBitsPerStep: pins.codec.maxBitsPerStep,
     softmaxPrecBits: pins.codec.softmaxPrecBits,
+    topK: pins.codec.topK ?? 128,
   };
 }
 
@@ -99,16 +101,21 @@ async function asyncEncode(
   const prefix: number[] = [];
   const cover: number[] = [];
   const trace: StepTrace[] = [];
-  const maxSteps = payloadBitLength * 8 + 64;
+  const maxSteps = payloadBitLength + 64;
   const wantTrace = cfg.trace === true;
   let step = 0;
   while (reader.remaining > 0) {
-    if (step >= maxSteps) throw new Error("encode exceeded step cap — model capacity too low for this bucketWidth.");
-    const plan = planStep(await source.logits(prefix), cfg);
-    const j = plan.k > 0 ? reader.readBits(plan.k) : 0;
-    const tokenId = plan.ranking[j]!;
+    if (step >= maxSteps) throw new Error("encode exceeded step cap — model capacity too low.");
+    const model = buildStepModel(await source.logits(prefix), cfg);
+    let node = model.root;
+    let codeLen = 0;
+    while (node.token === undefined) {
+      node = reader.readBit() === 0 ? node.left! : node.right!;
+      codeLen++;
+    }
+    const tokenId = node.token;
     cover.push(tokenId);
-    if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, plan, j));
+    if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, codeLen));
     prefix.push(tokenId);
     step++;
   }
@@ -125,35 +132,22 @@ async function asyncDecode(
   const trace: StepTrace[] = [];
   const wantTrace = cfg.trace === true;
   for (let step = 0; step < cover.length; step++) {
-    const plan = planStep(await source.logits(prefix), cfg);
+    const model = buildStepModel(await source.logits(prefix), cfg);
     const observed = cover[step]!;
-    if (observed < 0 || observed >= plan.quant.length) {
-      throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+    const code = model.codeOf.get(observed);
+    if (code === undefined) {
+      throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in top-K candidate set at step ${step}`);
     }
-    const j = rankOfQuantized(plan.quant, cfg.bucketWidth, observed);
-    if (plan.k > 0 && j >= 1 << plan.k)
-      throw new DivergenceError(step, "bucket", `observed token rank ${j} outside usable set (k=${plan.k}) at step ${step}`);
-    if (plan.k > 0) w.writeBits(j, plan.k);
-    if (wantTrace) trace.push(traceOf(step, prefix.length, observed, plan, j));
+    for (const bit of code) w.writeBit(bit);
+    if (wantTrace) trace.push(traceOf(step, prefix.length, observed, code.length));
     prefix.push(observed);
   }
   const fin = w.finish();
   return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
 }
 
-function traceOf(index: number, prefixLen: number, tokenId: number, plan: ReturnType<typeof planStep>, selectedRank: number): StepTrace {
-  const topN = Math.min(plan.ranking.length, 64);
-  return {
-    index,
-    prefixLen,
-    tokenId,
-    logitsHash: hashOf(plan.quant),
-    softmaxHash: hashOf(plan.probs),
-    rankingHash: hashOf(plan.ranking.slice(0, topN)),
-    k: plan.k,
-    selectedRank,
-    entropyBits: entropyBits(plan.probs, plan.denom),
-  };
+function traceOf(index: number, prefixLen: number, tokenId: number, codeLen: number): StepTrace {
+  return { index, prefixLen, tokenId, logitsHash: "", softmaxHash: "", rankingHash: "", k: codeLen, selectedRank: 0, entropyBits: 0 };
 }
 
 export interface EncodeOut {

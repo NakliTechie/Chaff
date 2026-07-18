@@ -42,6 +42,8 @@
     "expPolyId": "exp2neg-minimax-4",
     "bucketWidth": 512,
     "maxBitsPerStep": 6,
+    "topK": 128,
+    "coder": "huffman-entropy@1",
     "tieBreak": "token-id-asc",
     "rationale": "logitScale quantizes fp32 logits to integers (round(L*1024)). bucketWidth is the robustness/capacity dial swept by `npm run sweep`; 512 is the recorded knee for the reference LM (smallest width with >=0.98 per-token decision agreement under a ~0.008-logit simulated cross-arch perturbation). The coding decision runs on snap-to-grid bucketed logits: only the top 2^k candidates that sit in strictly-separated buckets carry bits, so per-arch logit noise that does not cross a bucket boundary cannot reorder the coding set."
   },

@@ -480,8 +480,11 @@ $("genBtn").addEventListener("click", async ()=>{
     const oneShot = async () => cid
       ? await Core.encodeMessage(source, pw, secret, cid, baseState, W)
       : await Core.encodeSecret(source, pw, secret, W);
+    // Each attempt re-salts the AEAD (fresh ciphertext → fresh tokens), so a
+    // message that doesn't re-tokenize cleanly usually round-trips on a retry.
     let done=null;
-    for(let attempt=0; attempt<6 && !done; attempt++){
+    const MAX_ATTEMPTS = 16;
+    for(let attempt=0; attempt<MAX_ATTEMPTS && !done; attempt++){
       const out = await oneShot();
       const text = tokenizer.decode(out.cover, { skip_special_tokens:true });
       const reids = tokenizer.encode(text, { add_special_tokens:false });
@@ -493,12 +496,11 @@ $("genBtn").addEventListener("click", async ()=>{
       $("copyBtn").dataset.val=done.text; $("copyBtn").disabled=false;
       $("genStat").innerHTML = cid ? `<span class="ok">Message #${done.seq} ready to send.</span>` : `<span class="ok">Ready to send.</span>`;
     } else {
-      const out = await oneShot();
-      if(cid) await saveConvState(cid, pw, out.newState);
-      const blob = tokensToBlob(out.cover);
-      $("coverOut").classList.remove("empty"); $("coverOut").classList.add("mono"); $("coverOut").textContent=blob;
-      $("copyBtn").dataset.val=blob; $("copyBtn").disabled=false;
-      $("genStat").innerHTML=`Sent as a compact code this time — the natural-text version didn’t come out cleanly. Regenerate for readable cover.`+(cid?` (message #${out.seq})`:``);
+      // Never ship a visible code blob dressed as cover — that gives the hidden
+      // message away and defeats the whole point. Fail honestly instead.
+      $("coverOut").classList.add("empty"); $("coverOut").textContent="Your cover text will appear here.";
+      $("copyBtn").disabled=true;
+      $("genStat").innerHTML=`<span class="warn">Couldn’t produce clean cover text in ${MAX_ATTEMPTS} tries.</span> This exact message doesn’t survive the tokenizer round-trip right now — reword it slightly or try another model. (Nothing was sent — a code blob would reveal there’s a hidden message.)`;
     }
   }catch(e){ $("genStat").innerHTML=`<span class="warn">Something went wrong.</span> ${escapeHtml(e?.message||String(e))}`;
     $("coverOut").textContent="—"; }

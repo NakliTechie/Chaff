@@ -200,6 +200,8 @@ var ChaffCoreNS = (() => {
       expPolyId: "exp2neg-minimax-4",
       bucketWidth: 512,
       maxBitsPerStep: 6,
+      topK: 128,
+      coder: "huffman-entropy@1",
       tieBreak: "token-id-asc",
       rationale: "logitScale quantizes fp32 logits to integers (round(L*1024)). bucketWidth is the robustness/capacity dial swept by `npm run sweep`; 512 is the recorded knee for the reference LM (smallest width with >=0.98 per-token decision agreement under a ~0.008-logit simulated cross-arch perturbation). The coding decision runs on snap-to-grid bucketed logits: only the top 2^k candidates that sit in strictly-separated buckets carry bits, so per-arch logit noise that does not cross a bucket boundary cannot reorder the coding set."
     },
@@ -487,9 +489,6 @@ var ChaffCoreNS = (() => {
     }
     return rank;
   }
-  function rankOfQuantized(quant, bucketWidth, tokenId) {
-    return rankOfToken(fillBuckets(quant, bucketWidth), tokenId);
-  }
   function planStep(logits, cfg) {
     const quant = quantize(logits, cfg.logitScale);
     const V = quant.length;
@@ -604,6 +603,63 @@ var ChaffCoreNS = (() => {
     }
     const fin = writer.finish();
     return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
+  }
+
+  // src/codec/entropy.ts
+  var DEFAULT_TOP_K = 128;
+  function topKByLogit(logits, logitScale, topK) {
+    const V = logits.length;
+    const K = Math.max(2, Math.min(topK, V));
+    const bestIds = [];
+    const bestQ = [];
+    for (let id = 0; id < V; id++) {
+      const q = Math.round(logits[id] * logitScale) | 0;
+      if (bestIds.length < K) {
+        let lo = 0, hi = bestIds.length;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          if (bestQ[mid] > q || bestQ[mid] === q && bestIds[mid] < id) lo = mid + 1;
+          else hi = mid;
+        }
+        bestIds.splice(lo, 0, id);
+        bestQ.splice(lo, 0, q);
+      } else if (q > bestQ[K - 1] || q === bestQ[K - 1] && id < bestIds[K - 1]) {
+        let lo = 0, hi = K - 1;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          if (bestQ[mid] > q || bestQ[mid] === q && bestIds[mid] < id) lo = mid + 1;
+          else hi = mid;
+        }
+        bestIds.splice(lo, 0, id);
+        bestQ.splice(lo, 0, q);
+        bestIds.pop();
+        bestQ.pop();
+      }
+    }
+    return { ids: bestIds, quant: bestQ };
+  }
+  function buildStepModel(logits, cfg) {
+    const { ids, quant } = topKByLogit(logits, cfg.logitScale, cfg.topK ?? DEFAULT_TOP_K);
+    const sm = fixedPointSoftmax(quant, { logitScale: cfg.logitScale, softmaxPrecBits: cfg.softmaxPrecBits });
+    let nodes = ids.map((id, i) => ({ weight: BigInt(sm.probs[i] + 1), minId: id, token: id }));
+    while (nodes.length > 1) {
+      nodes.sort((a, b) => a.weight === b.weight ? a.minId - b.minId : a.weight < b.weight ? -1 : 1);
+      const l = nodes.shift();
+      const r = nodes.shift();
+      nodes.push({ weight: l.weight + r.weight, minId: Math.min(l.minId, r.minId), left: l, right: r });
+    }
+    const root = nodes[0];
+    const codeOf = /* @__PURE__ */ new Map();
+    const walk = (node, path) => {
+      if (node.token !== void 0) {
+        codeOf.set(node.token, path);
+        return;
+      }
+      walk(node.left, [...path, 0]);
+      walk(node.right, [...path, 1]);
+    };
+    walk(root, []);
+    return { root, codeOf };
   }
 
   // src/crypto/aes-siv.ts
@@ -946,15 +1002,13 @@ var ChaffCoreNS = (() => {
 
   // src/browser/entry.ts
   var pins = pins_default;
-  function hashOf(a) {
-    return hashInts(a);
-  }
   function coderConfig(bucketWidthOverride) {
     return {
       logitScale: pins.codec.logitScale,
       bucketWidth: bucketWidthOverride ?? pins.codec.bucketWidth,
       maxBitsPerStep: pins.codec.maxBitsPerStep,
-      softmaxPrecBits: pins.codec.softmaxPrecBits
+      softmaxPrecBits: pins.codec.softmaxPrecBits,
+      topK: pins.codec.topK ?? 128
     };
   }
   function cryptoParams() {
@@ -983,16 +1037,21 @@ var ChaffCoreNS = (() => {
     const prefix = [];
     const cover = [];
     const trace = [];
-    const maxSteps = payloadBitLength * 8 + 64;
+    const maxSteps = payloadBitLength + 64;
     const wantTrace = cfg.trace === true;
     let step = 0;
     while (reader.remaining > 0) {
-      if (step >= maxSteps) throw new Error("encode exceeded step cap \u2014 model capacity too low for this bucketWidth.");
-      const plan = planStep(await source.logits(prefix), cfg);
-      const j = plan.k > 0 ? reader.readBits(plan.k) : 0;
-      const tokenId = plan.ranking[j];
+      if (step >= maxSteps) throw new Error("encode exceeded step cap \u2014 model capacity too low.");
+      const model = buildStepModel(await source.logits(prefix), cfg);
+      let node = model.root;
+      let codeLen = 0;
+      while (node.token === void 0) {
+        node = reader.readBit() === 0 ? node.left : node.right;
+        codeLen++;
+      }
+      const tokenId = node.token;
       cover.push(tokenId);
-      if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, plan, j));
+      if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, codeLen));
       prefix.push(tokenId);
       step++;
     }
@@ -1004,34 +1063,21 @@ var ChaffCoreNS = (() => {
     const trace = [];
     const wantTrace = cfg.trace === true;
     for (let step = 0; step < cover.length; step++) {
-      const plan = planStep(await source.logits(prefix), cfg);
+      const model = buildStepModel(await source.logits(prefix), cfg);
       const observed = cover[step];
-      if (observed < 0 || observed >= plan.quant.length) {
-        throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+      const code = model.codeOf.get(observed);
+      if (code === void 0) {
+        throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in top-K candidate set at step ${step}`);
       }
-      const j = rankOfQuantized(plan.quant, cfg.bucketWidth, observed);
-      if (plan.k > 0 && j >= 1 << plan.k)
-        throw new DivergenceError(step, "bucket", `observed token rank ${j} outside usable set (k=${plan.k}) at step ${step}`);
-      if (plan.k > 0) w.writeBits(j, plan.k);
-      if (wantTrace) trace.push(traceOf(step, prefix.length, observed, plan, j));
+      for (const bit of code) w.writeBit(bit);
+      if (wantTrace) trace.push(traceOf(step, prefix.length, observed, code.length));
       prefix.push(observed);
     }
     const fin = w.finish();
     return { bytes: fin.bytes, bitLength: fin.bitLength, trace };
   }
-  function traceOf(index, prefixLen, tokenId, plan, selectedRank) {
-    const topN = Math.min(plan.ranking.length, 64);
-    return {
-      index,
-      prefixLen,
-      tokenId,
-      logitsHash: hashOf(plan.quant),
-      softmaxHash: hashOf(plan.probs),
-      rankingHash: hashOf(plan.ranking.slice(0, topN)),
-      k: plan.k,
-      selectedRank,
-      entropyBits: entropyBits(plan.probs, plan.denom)
-    };
+  function traceOf(index, prefixLen, tokenId, codeLen) {
+    return { index, prefixLen, tokenId, logitsHash: "", softmaxHash: "", rankingHash: "", k: codeLen, selectedRank: 0, entropyBits: 0 };
   }
   async function encodeSecret(source, password, secret, bucketWidth) {
     const aad = new TextEncoder().encode(pins.payload.magic);

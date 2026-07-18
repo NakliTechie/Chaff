@@ -8,7 +8,7 @@
 import { loadPins } from "../src/pins.js";
 import { referenceLMFromPins } from "../src/inference/factory.js";
 import { coderConfigFromPins } from "../src/pipeline.js";
-import { encode as syncEncode, decode as syncDecode } from "../src/codec/coder.js";
+import { encodeEntropy as syncEncode, decodeEntropy as syncDecode } from "../src/codec/entropy.js";
 import { ChaffCore } from "../src/browser/entry.js";
 
 function arrEq(a: number[], b: number[]): boolean {

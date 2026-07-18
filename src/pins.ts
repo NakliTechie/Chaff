@@ -36,6 +36,8 @@ export interface Pins {
     bucketWidth: number;
     maxBitsPerStep: number;
     tieBreak: string;
+    topK?: number;
+    coder?: string;
     rationale?: string;
   };
   crypto: {

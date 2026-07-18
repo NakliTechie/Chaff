@@ -36,6 +36,8 @@ export interface CoderConfig {
   softmaxPrecBits: number;
   /** Optional hard ceiling on emitted tokens to guard against a zero-capacity model. */
   maxSteps?: number;
+  /** Entropy coder: number of top candidates per step to build the Huffman tree over. */
+  topK?: number;
   /**
    * When true, compute per-step diagnostic traces (hashes, entropy) and the
    * fixed-point softmax those traces depend on. Default false — the app/coding
