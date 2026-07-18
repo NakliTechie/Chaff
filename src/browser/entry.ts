@@ -70,6 +70,13 @@ function framePayload(blob: Uint8Array): { bytes: Uint8Array; bitLength: number 
 function unframePayload(bits: Uint8Array, bitLength: number): Uint8Array {
   const r = new BitReader(bits, bitLength);
   const blobLen = r.readBits(pins.payload.lengthFieldBits);
+  // Reject a corrupt/adversarial length before allocating — a valid frame's blob
+  // can't exceed the bytes actually decoded; otherwise a bogus 32-bit length triggers
+  // a multi-GB alloc + read loop (hang/OOM) before the AEAD tag rejects.
+  const maxBytes = Math.max(0, (bitLength - pins.payload.lengthFieldBits) >> 3);
+  if (blobLen > maxBytes) {
+    throw new Error(`frame claims ${blobLen} bytes but only ${maxBytes} decoded — corrupt cover`);
+  }
   const blob = new Uint8Array(blobLen);
   for (let i = 0; i < blobLen; i++) blob[i] = r.readBits(8);
   return blob;
