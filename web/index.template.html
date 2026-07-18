@@ -360,6 +360,19 @@ let toastTimer = null;
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"), 1400); }
 
+// Global error net — an exception thrown in an async handler otherwise produces
+// nothing (no toast, no log), which is exactly how a dead button survives. Surface
+// it (throttled) so failures are never silent. The reporter must never throw.
+let _lastErrAt = -1e9;
+function surfaceError(kind, detail){ try {
+  console.error("[" + kind + "]", detail);
+  const now = (typeof performance!=="undefined" ? performance.now() : 0);
+  if (now - _lastErrAt < 2000) return; _lastErrAt = now;
+  toast("Something went wrong — " + String(detail || kind).slice(0,120));
+} catch(_) {} }
+addEventListener("error", e => { if (e.error || e.message) surfaceError("uncaught", e.error?.message || e.message); });
+addEventListener("unhandledrejection", e => surfaceError("rejection", e.reason?.message || e.reason));
+
 // Generic causal-LM logit source — works for any transformers.js model. Seeds
 // context with the tokenizer's start token so both ends feed an identical prefix.
 //
@@ -517,7 +530,8 @@ $("genBtn").addEventListener("click", async ()=>{
 });
 
 $("copyBtn").addEventListener("click", ()=>{
-  navigator.clipboard.writeText($("copyBtn").dataset.val||"").then(()=>toast("Copied"));
+  navigator.clipboard.writeText($("copyBtn").dataset.val||"").then(()=>toast("Copied"))
+    .catch(()=>toast("Copy failed — select the cover text and copy manually"));
 });
 
 $("revBtn").addEventListener("click", async ()=>{
@@ -535,10 +549,16 @@ $("revBtn").addEventListener("click", async ()=>{
       let baseState=null;
       try{ baseState = await loadConvState(cid, pw); }catch(e){ throw new Error(`wrong password for conversation “${cid}”`); }
       const r = await Core.decodeMessage(source, pw, cover, cid, baseState, W);
-      await saveConvState(cid, pw, r.newState);
       $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(r.secret);
       const desc = escapeHtml(Core.describeStatus(r.status));
       $("revStat").innerHTML = r.status.ok ? `<span class="ok">Revealed · ${desc}</span>` : `<span class="warn">Revealed · ${desc}</span>`;
+      // Advance the local chain ONLY when it verified — a replayed/reordered message
+      // must not roll our state back and desync the conversation. Persist after showing
+      // the secret, in its own guard so a storage failure can't lose the decode.
+      if(r.status.ok){
+        try{ await saveConvState(cid, pw, r.newState); }
+        catch(e){ $("revStat").innerHTML += ` <span class="warn">(couldn’t save chain state)</span>`; }
+      }
     } else {
       const dec = await Core.decodeSecret(source, pw, cover, W);
       $("secretOut").classList.remove("empty"); $("secretOut").textContent = new TextDecoder().decode(dec.secret);
