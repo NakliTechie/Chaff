@@ -560,21 +560,69 @@ var ChaffCoreNS = (() => {
   function bucketId(q, width) {
     return Math.round(q / width);
   }
-  function planStep(logits, cfg) {
-    const quant = quantize(logits, cfg.logitScale);
+  function fillBuckets(quant, width) {
     const V = quant.length;
-    const W = cfg.bucketWidth;
     const bucket = new Int32Array(V);
-    for (let i = 0; i < V; i++) bucket[i] = bucketId(quant[i], W);
-    const idx = Array.from({ length: V }, (_, i) => i);
-    idx.sort((a, b) => bucket[b] - bucket[a] || a - b);
-    const maxK = Math.min(cfg.maxBitsPerStep, Math.floor(Math.log2(V)));
+    for (let i = 0; i < V; i++) bucket[i] = bucketId(quant[i], width);
+    return bucket;
+  }
+  function selectTopM(bucket, M) {
+    const V = bucket.length;
+    if (M <= 0 || V === 0) return [];
+    const m = M < V ? M : V;
+    const top = new Array(m);
+    const topB = new Array(m);
+    let size = 0;
+    for (let id = 0; id < V; id++) {
+      const b = bucket[id];
+      if (size < m) {
+        let lo = 0;
+        let hi = size;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          const mb = topB[mid];
+          const midId = top[mid];
+          if (mb > b || mb === b && midId < id) lo = mid + 1;
+          else hi = mid;
+        }
+        for (let i = size; i > lo; i--) {
+          top[i] = top[i - 1];
+          topB[i] = topB[i - 1];
+        }
+        top[lo] = id;
+        topB[lo] = b;
+        size++;
+      } else {
+        const lastB = topB[m - 1];
+        const lastId = top[m - 1];
+        if (!(b > lastB || b === lastB && id < lastId)) continue;
+        let lo = 0;
+        let hi = m - 1;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          const mb = topB[mid];
+          const midId = top[mid];
+          if (mb > b || mb === b && midId < id) lo = mid + 1;
+          else hi = mid;
+        }
+        for (let i = m - 1; i > lo; i--) {
+          top[i] = top[i - 1];
+          topB[i] = topB[i - 1];
+        }
+        top[lo] = id;
+        topB[lo] = b;
+      }
+    }
+    return top;
+  }
+  function capacityK(bucket, ranking, maxK) {
     let k = 0;
     for (let cand = 1; cand <= maxK; cand++) {
       const m = 1 << cand;
+      if (m > ranking.length) break;
       let ok = true;
       for (let j = 0; j < m - 1; j++) {
-        if (bucket[idx[j]] - bucket[idx[j + 1]] < 1) {
+        if (bucket[ranking[j]] - bucket[ranking[j + 1]] < 1) {
           ok = false;
           break;
         }
@@ -582,11 +630,49 @@ var ChaffCoreNS = (() => {
       if (ok) k = cand;
       else break;
     }
-    const sm = fixedPointSoftmax(Array.from(quant), {
-      logitScale: cfg.logitScale,
-      softmaxPrecBits: cfg.softmaxPrecBits
-    });
-    return { quant, ranking: idx, k, probs: sm.probs, denom: sm.denom };
+    return k;
+  }
+  function rankOfToken(bucket, tokenId) {
+    const bObs = bucket[tokenId];
+    let rank = 0;
+    for (let id = 0; id < tokenId; id++) {
+      if (bucket[id] >= bObs) rank++;
+    }
+    for (let id = tokenId + 1; id < bucket.length; id++) {
+      if (bucket[id] > bObs) rank++;
+    }
+    return rank;
+  }
+  function rankOfQuantized(quant, bucketWidth, tokenId) {
+    return rankOfToken(fillBuckets(quant, bucketWidth), tokenId);
+  }
+  function planStep(logits, cfg) {
+    const quant = quantize(logits, cfg.logitScale);
+    const V = quant.length;
+    const bucket = fillBuckets(quant, cfg.bucketWidth);
+    const maxK = Math.min(cfg.maxBitsPerStep, Math.floor(Math.log2(V)));
+    const topM = 1 << maxK;
+    const ranking = selectTopM(bucket, topM);
+    const k = capacityK(bucket, ranking, maxK);
+    if (cfg.trace) {
+      const quantArr = new Array(V);
+      for (let i = 0; i < V; i++) quantArr[i] = quant[i];
+      const sm = fixedPointSoftmax(quantArr, {
+        logitScale: cfg.logitScale,
+        softmaxPrecBits: cfg.softmaxPrecBits
+      });
+      return { quant, ranking, k, probs: sm.probs, denom: sm.denom };
+    }
+    return { quant, ranking, k, probs: [], denom: 0 };
+  }
+  function planCore(logits, cfg) {
+    const quant = quantize(logits, cfg.logitScale);
+    const bucket = fillBuckets(quant, cfg.bucketWidth);
+    const V = quant.length;
+    const maxK = Math.min(cfg.maxBitsPerStep, Math.floor(Math.log2(V)));
+    const ranking = selectTopM(bucket, 1 << maxK);
+    const k = capacityK(bucket, ranking, maxK);
+    return { quant, bucket, ranking, k };
   }
   function makeTrace(index, prefixLen, tokenId, plan, selectedRank) {
     const topN = Math.min(plan.ranking.length, 64);
@@ -602,12 +688,26 @@ var ChaffCoreNS = (() => {
       entropyBits: entropyBits(plan.probs, plan.denom)
     };
   }
+  function planFromCore(core, cfg) {
+    if (!cfg.trace) {
+      return { quant: core.quant, ranking: core.ranking, k: core.k, probs: [], denom: 0 };
+    }
+    const V = core.quant.length;
+    const quantArr = new Array(V);
+    for (let i = 0; i < V; i++) quantArr[i] = core.quant[i];
+    const sm = fixedPointSoftmax(quantArr, {
+      logitScale: cfg.logitScale,
+      softmaxPrecBits: cfg.softmaxPrecBits
+    });
+    return { quant: core.quant, ranking: core.ranking, k: core.k, probs: sm.probs, denom: sm.denom };
+  }
   function encode(source, payload, payloadBitLength, cfg, seedPrefix = []) {
     const reader = new BitReader(payload, payloadBitLength);
     const prefix = seedPrefix.slice();
     const cover = [];
     const trace = [];
     const maxSteps = cfg.maxSteps ?? payloadBitLength * 8 + 64;
+    const wantTrace = cfg.trace === true;
     let step = 0;
     while (reader.remaining > 0) {
       if (step >= maxSteps) {
@@ -616,12 +716,14 @@ var ChaffCoreNS = (() => {
         );
       }
       const logits = source.logits(prefix);
-      const plan = planStep(logits, cfg);
-      const k = plan.k;
+      const core = planCore(logits, cfg);
+      const k = core.k;
       const j = k > 0 ? reader.readBits(k) : 0;
-      const tokenId = plan.ranking[j];
+      const tokenId = core.ranking[j];
       cover.push(tokenId);
-      trace.push(makeTrace(step, prefix.length, tokenId, plan, j));
+      if (wantTrace) {
+        trace.push(makeTrace(step, prefix.length, tokenId, planFromCore(core, cfg), j));
+      }
       prefix.push(tokenId);
       step++;
     }
@@ -631,25 +733,29 @@ var ChaffCoreNS = (() => {
     const prefix = seedPrefix.slice();
     const writer = new BitWriter();
     const trace = [];
+    const wantTrace = cfg.trace === true;
     for (let step = 0; step < cover.length; step++) {
       if (wantBits !== void 0 && writer.bitLength >= wantBits) break;
       const logits = source.logits(prefix);
-      const plan = planStep(logits, cfg);
+      const core = planCore(logits, cfg);
       const observed = cover[step];
-      const j = plan.ranking.indexOf(observed);
-      if (j < 0) {
+      const V = core.bucket.length;
+      if (observed < 0 || observed >= V) {
         throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
       }
-      const usable = 1 << plan.k;
-      if (plan.k > 0 && j >= usable) {
+      const j = rankOfToken(core.bucket, observed);
+      const usable = 1 << core.k;
+      if (core.k > 0 && j >= usable) {
         throw new DivergenceError(
           step,
           "bucket",
-          `observed token rank ${j} outside usable set (k=${plan.k}, top ${usable}) at step ${step}`
+          `observed token rank ${j} outside usable set (k=${core.k}, top ${usable}) at step ${step}`
         );
       }
-      if (plan.k > 0) writer.writeBits(j, plan.k);
-      trace.push(makeTrace(step, prefix.length, observed, plan, j));
+      if (core.k > 0) writer.writeBits(j, core.k);
+      if (wantTrace) {
+        trace.push(makeTrace(step, prefix.length, observed, planFromCore(core, cfg), j));
+      }
       prefix.push(observed);
     }
     const fin = writer.finish();
@@ -1034,6 +1140,7 @@ var ChaffCoreNS = (() => {
     const cover = [];
     const trace = [];
     const maxSteps = payloadBitLength * 8 + 64;
+    const wantTrace = cfg.trace === true;
     let step = 0;
     while (reader.remaining > 0) {
       if (step >= maxSteps) throw new Error("encode exceeded step cap \u2014 model capacity too low for this bucketWidth.");
@@ -1041,7 +1148,7 @@ var ChaffCoreNS = (() => {
       const j = plan.k > 0 ? reader.readBits(plan.k) : 0;
       const tokenId = plan.ranking[j];
       cover.push(tokenId);
-      trace.push(traceOf(step, prefix.length, tokenId, plan, j));
+      if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, plan, j));
       prefix.push(tokenId);
       step++;
     }
@@ -1051,15 +1158,18 @@ var ChaffCoreNS = (() => {
     const prefix = [];
     const w = new BitWriter();
     const trace = [];
+    const wantTrace = cfg.trace === true;
     for (let step = 0; step < cover.length; step++) {
       const plan = planStep(await source.logits(prefix), cfg);
       const observed = cover[step];
-      const j = plan.ranking.indexOf(observed);
-      if (j < 0) throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+      if (observed < 0 || observed >= plan.quant.length) {
+        throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+      }
+      const j = rankOfQuantized(plan.quant, cfg.bucketWidth, observed);
       if (plan.k > 0 && j >= 1 << plan.k)
         throw new DivergenceError(step, "bucket", `observed token rank ${j} outside usable set (k=${plan.k}) at step ${step}`);
       if (plan.k > 0) w.writeBits(j, plan.k);
-      trace.push(traceOf(step, prefix.length, observed, plan, j));
+      if (wantTrace) trace.push(traceOf(step, prefix.length, observed, plan, j));
       prefix.push(observed);
     }
     const fin = w.finish();
@@ -1238,16 +1348,53 @@ function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("sho
 
 // Generic causal-LM logit source — works for any transformers.js model. Seeds
 // context with the tokenizer's start token so both ends feed an identical prefix.
+//
+// KV cache: the codec walks a prefix that grows by exactly one token per step,
+// so each call's prefix is the previous one plus a suffix. Re-running the whole
+// prefix every step is O(N²); instead we keep the model's past_key_values and
+// feed only the new token(s) when the request extends the cached prefix — O(N).
+// The fresh path (no past) is byte-identical to the original single-pass call,
+// so if any architecture's cache misbehaves we disable caching and fall back to
+// exactly the old, known-good behavior. Encode and decode walk the identical
+// prefix sequence, so both always take the same path → logits stay in lockstep.
 const source = {
   vocabSize: VOCAB, id: "model", weightHash: "onnx",
+  _prevOut: null,   // full model output whose present.* KV covers _ids
+  _ids: [],         // id sequence the cache currently covers
+  _noCache: false,  // set once if incremental caching ever fails (then behaves like the original)
+  reset(){ this._prevOut = null; this._ids = []; },
+  // transformers.js returns the KV cache as raw ONNX `present.*` outputs; the model
+  // consumes it as `past_key_values.*` inputs. Repack present→past for the next step.
+  _pastFrom(out){
+    const past = {}; let n = 0;
+    for (const k of Object.keys(out)) {
+      if (k.startsWith("present")) { past["past_key_values" + k.slice("present".length)] = out[k]; n++; }
+    }
+    return n ? past : null;
+  },
   async logits(prefix) {
-    const ids = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
-    const n = ids.length;
-    const input_ids = new TF.Tensor("int64", BigInt64Array.from(ids.map((x)=>BigInt(x))), [1, n]);
-    const attention_mask = new TF.Tensor("int64", BigInt64Array.from(ids.map(()=>1n)), [1, n]);
-    const out = await model({ input_ids, attention_mask });
-    const t = out.logits, seq = t.dims[1], V = t.dims[2], data = t.data, off = (seq-1)*V;
-    const f = new Float64Array(V); for (let i=0;i<V;i++) f[i]=data[off+i]; return f;
+    const full = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
+    const past = (!this._noCache && this._prevOut && this._ids.length > 0
+      && this._ids.length < full.length && this._ids.every((x,i)=>x===full[i]))
+      ? this._pastFrom(this._prevOut) : null;
+    const feedIds = past ? full.slice(this._ids.length) : full;
+    const total = full.length;
+    try {
+      const input_ids = new TF.Tensor("int64", BigInt64Array.from(feedIds.map((x)=>BigInt(x))), [1, feedIds.length]);
+      const attention_mask = new TF.Tensor("int64", BigInt64Array.from({length: total}, ()=>1n), [1, total]);
+      const inputs = { input_ids, attention_mask };
+      if (past) inputs.past_key_values = past;
+      const out = await model(inputs);
+      this._prevOut = out;
+      this._ids = full.slice();
+      const t = out.logits, seq = t.dims[1], V = t.dims[2], data = t.data, off = (seq-1)*V;
+      const f = new Float64Array(V); for (let i=0;i<V;i++) f[i]=data[off+i]; return f;
+    } catch (e) {
+      // Incremental caching failed for this architecture — disable it and fall
+      // back to the original full-prefix path (correct, just O(N²)).
+      if (past) { this._noCache = true; this.reset(); return this.logits(prefix); }
+      throw e;
+    }
   }
 };
 const idsEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
@@ -1362,7 +1509,10 @@ $("revBtn").addEventListener("click", async ()=>{
   $("secretOut").classList.add("empty"); $("secretOut").textContent="Working…";
   const pw=$("pass").value, W=bucketWidth(), input=$("coverIn").value, cid=convId();
   try{
-    const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input.trim(), { add_special_tokens:false });
+    // Encode the cover text EXACTLY as received — GPT-2 BPE is whitespace-sensitive and the
+    // encoder's cover often begins/ends with a whitespace token, so trimming here would change
+    // the tokenization and break the round-trip. (The chaff: blob branch is whitespace-safe.)
+    const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input, { add_special_tokens:false });
     if(cid){
       let baseState=null;
       try{ baseState = await loadConvState(cid, pw); }catch(e){ throw new Error(`wrong password for conversation “${cid}”`); }

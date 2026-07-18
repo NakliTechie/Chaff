@@ -26,6 +26,30 @@ offline after the model loads. The cross-arch determinism tester is at
 The sections below document the headless determinism spike (the Node gate suite)
 that backs the app — it is not needed to use the page.
 
+## Performance (in-browser)
+
+Hiding/revealing a message runs the model once per cover token. Two things keep
+that fast (both preserve the determinism contract — the gate suite stays green
+and cover tokens are bit-identical before/after):
+
+- **KV cache.** The codec walks a prefix that grows by one token per step, so
+  `source.logits()` feeds only the new token plus the model's cached
+  `past_key_values` instead of re-running the whole prefix every step. This turns
+  per-token model cost from `O(N)`-and-growing into roughly flat (~11–19 ms/token
+  for GPT-2 on the WASM backend), i.e. the overall encode from `O(N²)` to `O(N)`.
+  If a model's cache shape doesn't cooperate it transparently falls back to the
+  original full-prefix path (correct, just slower).
+- **Diagnostics off the hot path.** The per-step divergence trace (three
+  full-vocab hashes + entropy) and the fixed-point softmax it needs are `cfg.trace`
+  opt-in; the app skips them entirely. Combined with the `O(V)` partial-selection
+  coder (no full 50k-token argsort), per-step codec work drops from tens of ms to
+  well under 1 ms, so wall-clock is model-bound rather than JS-bound.
+
+Cover length — and therefore total time — scales with the payload size and
+**inversely** with bits-per-token: a wider bucket width is more robust but emits
+more tokens. Lower the bucket width (Advanced) for shorter, faster covers when
+both sides can match it.
+
 ## Honest threat model — read this first
 
 Chaff produces **plausible cover under casual or manual review.** It reads as
@@ -73,14 +97,21 @@ that always blames step 0 fails); G3 uses published KAT vectors.
 1. **Backend:** ONNX Runtime Web, WASM EP, fp32, single-thread. No WebGPU. (In
    the cross-arch tester; the local gates use a deterministic reference LM — see
    below.)
-2. **The codec computes its own fixed-point softmax** — integer math, fixed
-   denominator, deterministic rounding (`src/fixedpoint.ts`). The backend's
-   float softmax is never on the coding path.
-3. **Encode against `argsort(logits)` + snap-to-grid bucketed gaps**
-   (`src/codec/coder.ts`). Only the top `2^k` candidates that sit in strictly
-   separated buckets carry bits, so per-arch logit noise that doesn't cross a
-   bucket boundary can't reorder the coding set. **Bucket width is the
-   robustness/capacity dial** — swept, with the knee recorded and pinned.
+2. **Token selection runs on quantized integer logits only** — `q[i] =
+   round(logit[i] * logitScale)`, snapped onto the bucket grid. The float
+   softmax is never on the coding path. A fixed-point softmax (`src/fixedpoint.ts`,
+   integer math, deterministic rounding) is computed **only** for the diagnostic
+   trace (entropy / capacity reporting) and is **opt-in** via `cfg.trace`; the
+   app and the round-trip never pay for it.
+3. **Encode against snap-to-grid bucketed gaps** (`src/codec/coder.ts`), with the
+   ranking ordered by bucket descending, tie-break token-id ascending. Only the
+   top `2^k` candidates that sit in strictly separated buckets carry bits, so
+   per-arch logit noise that doesn't cross a bucket boundary can't reorder the
+   coding set. **Bucket width is the robustness/capacity dial** — swept, with the
+   knee recorded and pinned. The coding path never does a full `O(V log V)`
+   argsort: encode selects only the top `2^maxBitsPerStep` (≤ 64) candidates and
+   decode recovers a token's rank by an `O(V)` outrank count — bit-identical to
+   the full sort, just far cheaper (see Performance).
 4. **Everything is pinned** in [`pins.json`](./pins.json) (model + hash,
    tokenizer, opset, ORT-Web version, bucket width, precision, KDF). Both sides
    load-or-refuse (`src/pins.ts`).
@@ -135,7 +166,7 @@ src/
     reference-lm.ts       deterministic fixed-weight transformer (local oracle)
     factory.ts            build the reference LM from pins
   codec/
-    coder.ts              rank-bucket coder + per-step trace (mandate #3)
+    coder.ts              rank-bucket coder (O(V) top-K select + O(V) rank; opt-in trace) (mandate #3)
     sweep.ts              bucket-width / capacity knee sweep (G4)
   crypto/
     aead.ts               PBKDF2≥600k → AES-256-SIV (msgs) / AES-256-GCM (at-rest)

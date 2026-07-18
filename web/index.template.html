@@ -355,16 +355,53 @@ function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("sho
 
 // Generic causal-LM logit source — works for any transformers.js model. Seeds
 // context with the tokenizer's start token so both ends feed an identical prefix.
+//
+// KV cache: the codec walks a prefix that grows by exactly one token per step,
+// so each call's prefix is the previous one plus a suffix. Re-running the whole
+// prefix every step is O(N²); instead we keep the model's past_key_values and
+// feed only the new token(s) when the request extends the cached prefix — O(N).
+// The fresh path (no past) is byte-identical to the original single-pass call,
+// so if any architecture's cache misbehaves we disable caching and fall back to
+// exactly the old, known-good behavior. Encode and decode walk the identical
+// prefix sequence, so both always take the same path → logits stay in lockstep.
 const source = {
   vocabSize: VOCAB, id: "model", weightHash: "onnx",
+  _prevOut: null,   // full model output whose present.* KV covers _ids
+  _ids: [],         // id sequence the cache currently covers
+  _noCache: false,  // set once if incremental caching ever fails (then behaves like the original)
+  reset(){ this._prevOut = null; this._ids = []; },
+  // transformers.js returns the KV cache as raw ONNX `present.*` outputs; the model
+  // consumes it as `past_key_values.*` inputs. Repack present→past for the next step.
+  _pastFrom(out){
+    const past = {}; let n = 0;
+    for (const k of Object.keys(out)) {
+      if (k.startsWith("present")) { past["past_key_values" + k.slice("present".length)] = out[k]; n++; }
+    }
+    return n ? past : null;
+  },
   async logits(prefix) {
-    const ids = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
-    const n = ids.length;
-    const input_ids = new TF.Tensor("int64", BigInt64Array.from(ids.map((x)=>BigInt(x))), [1, n]);
-    const attention_mask = new TF.Tensor("int64", BigInt64Array.from(ids.map(()=>1n)), [1, n]);
-    const out = await model({ input_ids, attention_mask });
-    const t = out.logits, seq = t.dims[1], V = t.dims[2], data = t.data, off = (seq-1)*V;
-    const f = new Float64Array(V); for (let i=0;i<V;i++) f[i]=data[off+i]; return f;
+    const full = startTok!=null ? [startTok, ...prefix] : (prefix.length ? prefix : [0]);
+    const past = (!this._noCache && this._prevOut && this._ids.length > 0
+      && this._ids.length < full.length && this._ids.every((x,i)=>x===full[i]))
+      ? this._pastFrom(this._prevOut) : null;
+    const feedIds = past ? full.slice(this._ids.length) : full;
+    const total = full.length;
+    try {
+      const input_ids = new TF.Tensor("int64", BigInt64Array.from(feedIds.map((x)=>BigInt(x))), [1, feedIds.length]);
+      const attention_mask = new TF.Tensor("int64", BigInt64Array.from({length: total}, ()=>1n), [1, total]);
+      const inputs = { input_ids, attention_mask };
+      if (past) inputs.past_key_values = past;
+      const out = await model(inputs);
+      this._prevOut = out;
+      this._ids = full.slice();
+      const t = out.logits, seq = t.dims[1], V = t.dims[2], data = t.data, off = (seq-1)*V;
+      const f = new Float64Array(V); for (let i=0;i<V;i++) f[i]=data[off+i]; return f;
+    } catch (e) {
+      // Incremental caching failed for this architecture — disable it and fall
+      // back to the original full-prefix path (correct, just O(N²)).
+      if (past) { this._noCache = true; this.reset(); return this.logits(prefix); }
+      throw e;
+    }
   }
 };
 const idsEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
@@ -479,7 +516,10 @@ $("revBtn").addEventListener("click", async ()=>{
   $("secretOut").classList.add("empty"); $("secretOut").textContent="Working…";
   const pw=$("pass").value, W=bucketWidth(), input=$("coverIn").value, cid=convId();
   try{
-    const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input.trim(), { add_special_tokens:false });
+    // Encode the cover text EXACTLY as received — GPT-2 BPE is whitespace-sensitive and the
+    // encoder's cover often begins/ends with a whitespace token, so trimming here would change
+    // the tokenization and break the round-trip. (The chaff: blob branch is whitespace-safe.)
+    const cover = looksLikeBlob(input) ? blobToTokens(input) : tokenizer.encode(input, { add_special_tokens:false });
     if(cid){
       let baseState=null;
       try{ baseState = await loadConvState(cid, pw); }catch(e){ throw new Error(`wrong password for conversation “${cid}”`); }
