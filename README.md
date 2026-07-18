@@ -10,6 +10,22 @@ assumption — that an arithmetic-coding stego stream round-trips bit-exact — 
 hands the human exactly one step: a cross-architecture round-trip (G2) they run
 in a real browser on a second machine.
 
+## Use it (no install, no build)
+
+The usable app is a single self-contained file, [`index.html`](./index.html),
+served live via GitHub Pages:
+
+**→ https://naklitechie.github.io/Chaff/**
+
+Open it, click **Load model** (one-time GPT-2 download, cached after), set a
+shared password, then **Hide** a secret into innocent cover text or **Reveal**
+one you received. Everything runs in your browser — no server, no account,
+offline after the model loads. The cross-arch determinism tester is at
+[`/crossarch/`](https://naklitechie.github.io/Chaff/crossarch/).
+
+The sections below document the headless determinism spike (the Node gate suite)
+that backs the app — it is not needed to use the page.
+
 ## Honest threat model — read this first
 
 Chaff produces **plausible cover under casual or manual review.** It reads as

@@ -25,10 +25,19 @@ const result = await build({
 });
 
 const bundle = result.outputFiles[0]!.text;
-const template = readFileSync(resolve(root, "crossarch/template.html"), "utf8");
 const placeholder = "/*__CHAFF_CORE_BUNDLE__*/";
-if (!template.includes(placeholder)) throw new Error("template missing core-bundle placeholder");
-const html = template.replace(placeholder, bundle);
-const outPath = resolve(root, "crossarch/index.html");
-writeFileSync(outPath, html, "utf8");
-console.log(`built ${outPath} (${(html.length / 1024).toFixed(1)} KB, core bundle ${(bundle.length / 1024).toFixed(1)} KB)`);
+
+const targets: [string, string][] = [
+  ["web/index.template.html", "index.html"], // the usable single-file app (GitHub Pages landing)
+  ["crossarch/template.html", "crossarch/index.html"], // the cross-arch determinism tester (G2)
+];
+
+for (const [tpl, out] of targets) {
+  const template = readFileSync(resolve(root, tpl), "utf8");
+  if (!template.includes(placeholder)) throw new Error(`${tpl} missing core-bundle placeholder`);
+  const html = template.replace(placeholder, bundle);
+  const outPath = resolve(root, out);
+  writeFileSync(outPath, html, "utf8");
+  console.log(`built ${out} (${(html.length / 1024).toFixed(1)} KB)`);
+}
+console.log(`core bundle ${(bundle.length / 1024).toFixed(1)} KB`);
