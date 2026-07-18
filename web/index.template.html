@@ -102,6 +102,28 @@
     background:var(--fg); color:var(--bg); padding:9px 16px; border-radius:20px; font-size:13px; font-weight:600;
     opacity:0; pointer-events:none; transition:opacity .2s, transform .2s; }
   .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
+  .help-btn { padding:6px 13px; font-size:13px; }
+  .modal-backdrop { position:fixed; inset:0; background:rgba(3,7,12,.62); backdrop-filter:blur(2px);
+    display:flex; align-items:center; justify-content:center; padding:18px; z-index:50; }
+  .modal-backdrop[hidden] { display:none; }
+  .modal { background:var(--panel); border:1px solid var(--border); border-radius:16px; width:100%;
+    max-width:540px; max-height:86vh; overflow:auto; box-shadow:0 24px 60px rgba(0,0,0,.45);
+    animation:pop .16s ease-out; }
+  @keyframes pop { from { transform:translateY(8px) scale(.99); opacity:0; } to { transform:none; opacity:1; } }
+  .modal-head { position:sticky; top:0; background:var(--panel); display:flex; align-items:center;
+    justify-content:space-between; padding:18px 20px 12px; border-bottom:1px solid var(--border); }
+  .modal-head h3 { margin:0; font-size:17px; }
+  .icon-btn { background:transparent; border:0; color:var(--muted); font-size:16px; cursor:pointer;
+    width:32px; height:32px; border-radius:8px; }
+  .icon-btn:hover { background:var(--panel2); color:var(--fg); }
+  .modal-body { padding:16px 20px 22px; font-size:14.5px; line-height:1.62; }
+  .modal-body h4 { margin:18px 0 6px; font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); }
+  .modal-body p { margin:0 0 10px; }
+  .modal-body ol, .modal-body ul { margin:0 0 6px; padding-left:20px; }
+  .modal-body li { margin:5px 0; }
+  .modal-body b { color:var(--fg); }
+  .modal-foot { margin-top:16px; color:var(--muted); font-size:12.5px; }
 </style>
 </head>
 <body>
@@ -114,6 +136,8 @@
         <path d="M9 12.2l2 2 4-4.4" stroke="var(--accent)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       <h1>Chaff</h1>
+      <span class="spacer"></span>
+      <button id="helpBtn" class="ghost help-btn" aria-haspopup="dialog">Help</button>
     </div>
     <p class="tag">Hide a private message inside ordinary-looking text. The model runs entirely in your
       browser — no server, no account, and it works offline once loaded.</p>
@@ -195,21 +219,61 @@
     Encryption: PBKDF2 → AES-256-GCM. Open source, AGPL-3.0.
   </div>
 </div>
+
+<div class="modal-backdrop" id="helpModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <div class="modal-head">
+      <h3 id="helpTitle">How Chaff works</h3>
+      <button id="helpClose" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p>Chaff encrypts your message, then uses a language model to weave the ciphertext into
+        natural-looking <b>cover text</b>. Your recipient — with the same model and the same password —
+        runs it in reverse to get the message back. Everything happens in your browser.</p>
+
+      <h4>Using it</h4>
+      <ol>
+        <li><b>Load the model</b> once (it’s cached afterward and works offline).</li>
+        <li>You and your recipient set the <b>same shared password</b>. Agree on it through a separate,
+          trusted channel — not in the same chat you’ll send the cover text through.</li>
+        <li><b>Hide:</b> type your secret, press Generate, and copy the cover text. Send it via any
+          chat app, email, wherever.</li>
+        <li><b>Reveal:</b> paste the cover text you received and press Reveal.</li>
+      </ol>
+
+      <h4>Tips</h4>
+      <ul>
+        <li>Both sides must use the <b>same password</b> and the <b>same bucket width</b> (under Advanced).</li>
+        <li>If a reveal fails, regenerate the cover text, or nudge bucket width up a notch on both sides.</li>
+        <li>Paste as plain text — apps that auto-format or “smarten” quotes can alter the cover.</li>
+        <li>The built-in self-test (Advanced) confirms the core works without downloading the model.</li>
+      </ul>
+
+      <h4>What it does and doesn’t protect</h4>
+      <p>Chaff hides <b>that</b> a message exists from casual reading and keyword filters. It is
+        <b>not</b> undetectable: someone who has this exact model and specifically suspects
+        steganography can detect it statistically. Your safety rests on the password staying secret and
+        on not being individually targeted by a matched-model detector. Treat it as cover, not a guarantee.</p>
+
+      <p class="modal-foot">Open source, AGPL-3.0 · runs GPT-2 locally via transformers.js.</p>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast">Copied</div>
 
 <!-- Shared core (esbuild IIFE → window.ChaffCore), byte-identical to the verified Node gate core. -->
 <script>/*__CHAFF_CORE_BUNDLE__*/</script>
 
 <script type="module">
-import { AutoTokenizer, AutoModelForCausalLM, Tensor, env }
-  from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5/dist/transformers.min.js";
+// transformers.js is loaded lazily (only when the model is loaded) so the rest
+// of the UI — tabs, help, and the offline self-test — works with no network.
+const TF_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5/dist/transformers.min.js";
+let TF = null;
 
 const Core = window.ChaffCore;
 const pins = Core.pins;
 const $ = (id) => document.getElementById(id);
-
-env.allowLocalModels = false;
-env.backends.onnx.wasm.numThreads = 1; // single-thread for determinism
 
 const EOT = 50256;
 let tokenizer = null, model = null, VOCAB = 50257, ready = false;
@@ -227,6 +291,15 @@ function selectTab(which){
 $("tabEnc").addEventListener("click", ()=>selectTab("enc"));
 $("tabDec").addEventListener("click", ()=>selectTab("dec"));
 
+// help modal
+const helpModal = $("helpModal");
+const openHelp = ()=>{ helpModal.hidden=false; $("helpClose").focus(); };
+const closeHelp = ()=>{ helpModal.hidden=true; $("helpBtn").focus(); };
+$("helpBtn").addEventListener("click", openHelp);
+$("helpClose").addEventListener("click", closeHelp);
+helpModal.addEventListener("click", (e)=>{ if(e.target===helpModal) closeHelp(); });
+document.addEventListener("keydown", (e)=>{ if(e.key==="Escape" && !helpModal.hidden) closeHelp(); });
+
 let toastTimer = null;
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show");
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove("show"), 1400); }
@@ -235,8 +308,8 @@ const gpt2 = {
   vocabSize: VOCAB, id: "Xenova/gpt2", weightHash: "onnx-fp32",
   async logits(prefix) {
     const ids = [EOT, ...prefix]; const n = ids.length;
-    const input_ids = new Tensor("int64", BigInt64Array.from(ids.map((x)=>BigInt(x))), [1, n]);
-    const attention_mask = new Tensor("int64", BigInt64Array.from(ids.map(()=>1n)), [1, n]);
+    const input_ids = new TF.Tensor("int64", BigInt64Array.from(ids.map((x)=>BigInt(x))), [1, n]);
+    const attention_mask = new TF.Tensor("int64", BigInt64Array.from(ids.map(()=>1n)), [1, n]);
     const out = await model({ input_ids, attention_mask });
     const t = out.logits, seq = t.dims[1], V = t.dims[2], data = t.data, off = (seq-1)*V;
     const f = new Float64Array(V); for (let i=0;i<V;i++) f[i]=data[off+i]; return f;
@@ -271,8 +344,9 @@ $("loadBtn").addEventListener("click", async ()=>{
   const onprog=(p)=>{ if(p&&p.progress!=null){ $("prog").value=p.progress;
     $("loadStat").textContent=(p.file? p.file.split("/").pop()+" ":"")+Math.round(p.progress)+"%"; } };
   try{
-    tokenizer = await AutoTokenizer.from_pretrained("Xenova/gpt2", { progress_callback:onprog });
-    model = await AutoModelForCausalLM.from_pretrained("Xenova/gpt2", { dtype:"fp32", device:"wasm", progress_callback:onprog });
+    if(!TF){ TF = await import(TF_URL); TF.env.allowLocalModels=false; TF.env.backends.onnx.wasm.numThreads=1; }
+    tokenizer = await TF.AutoTokenizer.from_pretrained("Xenova/gpt2", { progress_callback:onprog });
+    model = await TF.AutoModelForCausalLM.from_pretrained("Xenova/gpt2", { dtype:"fp32", device:"wasm", progress_callback:onprog });
     const probe = await gpt2.logits([]); VOCAB=probe.length; gpt2.vocabSize=VOCAB;
     setModelReady();
   }catch(e){
