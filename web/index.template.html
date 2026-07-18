@@ -389,7 +389,7 @@ const source = {
   _prevOut: null,   // full model output whose present.* KV covers _ids
   _ids: [],         // id sequence the cache currently covers
   _noCache: false,  // set once if incremental caching ever fails (then behaves like the original)
-  reset(){ this._prevOut = null; this._ids = []; },
+  reset(){ this._prevOut = null; this._ids = []; this._noCache = false; },
   // transformers.js returns the KV cache as raw ONNX `present.*` outputs; the model
   // consumes it as `past_key_values.*` inputs. Repack present→past for the next step.
   _pastFrom(out){
@@ -426,14 +426,8 @@ const source = {
   }
 };
 const idsEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
-const bytesEq = (a,b) => a.length===b.length && a.every((x,i)=>x===b[i]);
+const bytesEq = idsEq; // same elementwise-equality; kept as a name for byte arrays
 
-function tokensToBlob(cover){
-  const buf=new Uint8Array(9+cover.length*2), dv=new DataView(buf.buffer);
-  buf[0]=67;buf[1]=72;buf[2]=70;buf[3]=48; dv.setUint8(4,1); dv.setUint32(5,cover.length,true);
-  for(let i=0;i<cover.length;i++) dv.setUint16(9+i*2,cover[i],true);
-  let s=""; for(const b of buf) s+=String.fromCharCode(b); return "chaff:"+btoa(s);
-}
 function blobToTokens(str){
   const s=atob(str.replace(/^chaff:/,"").trim()); const buf=new Uint8Array(s.length);
   for(let i=0;i<s.length;i++) buf[i]=s.charCodeAt(i); const dv=new DataView(buf.buffer);
@@ -468,6 +462,7 @@ function setModelReady(){
 }
 
 $("loadBtn").addEventListener("click", async ()=>{
+  source.reset(); // drop any KV cache from a previously-loaded model before switching
   $("loadBtn").disabled=true; $("prog").classList.remove("hidden"); $("prog").value=0;
   $("modelPill").classList.remove("on","err"); $("modelPillText").textContent="Loading…";
   const onprog=(p)=>{ if(p&&p.progress!=null){ $("prog").value=p.progress;

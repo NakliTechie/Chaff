@@ -30,7 +30,3 @@ export function hashInts(values: ArrayLike<number>): string {
   }
   return hashHex(buf);
 }
-
-export function hashString(s: string): string {
-  return hashHex(new TextEncoder().encode(s));
-}

@@ -9,7 +9,6 @@
 import type { LogitSource } from "../inference/types.js";
 import type { Pins } from "../pins.js";
 import { decodeSecret, encodeSecret } from "../pipeline.js";
-import { localize } from "./localizer.js";
 import { SplitMix64 } from "../util/prng.js";
 
 export interface RoundTripCase {
@@ -73,9 +72,13 @@ export async function runRoundTrip(
       const ok = bytesEqual(secret, dec.secret);
       c = { index: i, secretLen: len, coverTokens: enc.cover.length, ok };
       if (!ok) {
-        // Localize the first diverging step for the state file's tried-trail.
-        const div = localize(enc.trace, dec.trace);
-        c.detail = `mismatch: recovered ${dec.secret.length}B vs ${len}B; ${div.detail}`;
+        // The pipeline runs the entropy coder WITHOUT traces, so localize() would
+        // see empty traces and falsely report "traces identical" on a real
+        // mismatch. Report the raw byte divergence instead.
+        let diffAt = -1;
+        const m = Math.min(secret.length, dec.secret.length);
+        for (let j = 0; j < m; j++) if (secret[j] !== dec.secret[j]) { diffAt = j; break; }
+        c.detail = `mismatch: recovered ${dec.secret.length}B vs ${len}B; first byte diff at ${diffAt < 0 ? "(length only)" : diffAt}`;
       }
     } catch (e) {
       c = { index: i, secretLen: len, coverTokens: 0, ok: false, detail: `threw: ${(e as Error).message}` };
