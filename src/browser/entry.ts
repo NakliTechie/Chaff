@@ -10,7 +10,15 @@
  */
 import pinsJson from "../../pins.json" with { type: "json" };
 import type { LogitSource } from "../inference/types.js";
-import { planStep, encode, decode, DivergenceError, type CoderConfig, type StepTrace } from "../codec/coder.js";
+import {
+  planStep,
+  encode,
+  decode,
+  DivergenceError,
+  rankOfQuantized,
+  type CoderConfig,
+  type StepTrace,
+} from "../codec/coder.js";
 import { fixedPointSoftmax, entropyBits } from "../fixedpoint.js";
 import { hashInts } from "../util/hash.js";
 import { BitReader, BitWriter } from "../util/bits.js";
@@ -92,6 +100,7 @@ async function asyncEncode(
   const cover: number[] = [];
   const trace: StepTrace[] = [];
   const maxSteps = payloadBitLength * 8 + 64;
+  const wantTrace = cfg.trace === true;
   let step = 0;
   while (reader.remaining > 0) {
     if (step >= maxSteps) throw new Error("encode exceeded step cap — model capacity too low for this bucketWidth.");
@@ -99,7 +108,7 @@ async function asyncEncode(
     const j = plan.k > 0 ? reader.readBits(plan.k) : 0;
     const tokenId = plan.ranking[j]!;
     cover.push(tokenId);
-    trace.push(traceOf(step, prefix.length, tokenId, plan, j));
+    if (wantTrace) trace.push(traceOf(step, prefix.length, tokenId, plan, j));
     prefix.push(tokenId);
     step++;
   }
@@ -114,15 +123,18 @@ async function asyncDecode(
   const prefix: number[] = [];
   const w = new BitWriter();
   const trace: StepTrace[] = [];
+  const wantTrace = cfg.trace === true;
   for (let step = 0; step < cover.length; step++) {
     const plan = planStep(await source.logits(prefix), cfg);
     const observed = cover[step]!;
-    const j = plan.ranking.indexOf(observed);
-    if (j < 0) throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+    if (observed < 0 || observed >= plan.quant.length) {
+      throw new DivergenceError(step, "tokenizer", `cover token ${observed} not in vocabulary at step ${step}`);
+    }
+    const j = rankOfQuantized(plan.quant, cfg.bucketWidth, observed);
     if (plan.k > 0 && j >= 1 << plan.k)
       throw new DivergenceError(step, "bucket", `observed token rank ${j} outside usable set (k=${plan.k}) at step ${step}`);
     if (plan.k > 0) w.writeBits(j, plan.k);
-    trace.push(traceOf(step, prefix.length, observed, plan, j));
+    if (wantTrace) trace.push(traceOf(step, prefix.length, observed, plan, j));
     prefix.push(observed);
   }
   const fin = w.finish();

@@ -13,9 +13,14 @@
  *                 logits by construction (that invariance is itself a guarantee).
  */
 import type { LogitSource } from "../inference/types.js";
-import { encode, planStep, type CoderConfig, type StepTrace } from "../codec/coder.js";
+import { encode, planStep, rankOfQuantized, type CoderConfig, type StepTrace } from "../codec/coder.js";
 import { hashInts } from "../util/hash.js";
 import { localize, type DivergenceReport } from "./localizer.js";
+
+/** Fault-injection / localizer paths need diagnostic traces + softmax hashes. */
+function withTrace(cfg: CoderConfig): CoderConfig {
+  return cfg.trace ? cfg : { ...cfg, trace: true };
+}
 
 /** Wraps a source and perturbs one token's logit at exactly one step. */
 export class LogitFaultSource implements LogitSource {
@@ -56,7 +61,7 @@ function encodeTrace(source: LogitSource, cfg: CoderConfig): { cover: number[]; 
   // Deterministic payload long enough to have many coding steps.
   const payload = new Uint8Array(24);
   for (let i = 0; i < payload.length; i++) payload[i] = (i * 37 + 11) & 0xff;
-  const r = encode(source, payload, payload.length * 8, cfg);
+  const r = encode(source, payload, payload.length * 8, withTrace(cfg));
   return { cover: r.cover, trace: r.trace };
 }
 
@@ -71,12 +76,17 @@ function hashOf(a: ArrayLike<number>): string {
  * localizer always receives a full, aligned trace to compare.
  */
 function decodeTrace(source: LogitSource, cover: number[], cfg: CoderConfig): StepTrace[] {
+  const tcfg = withTrace(cfg);
   const prefix: number[] = [];
   const trace: StepTrace[] = [];
   for (let step = 0; step < cover.length; step++) {
-    const plan = planStep(source.logits(prefix), cfg);
+    const plan = planStep(source.logits(prefix), tcfg);
     const observed = cover[step]!;
-    const j = plan.ranking.indexOf(observed);
+    // Ranking is only the top-M prefix; rank of any vocab token is O(V).
+    const j =
+      observed >= 0 && observed < plan.quant.length
+        ? rankOfQuantized(plan.quant, tcfg.bucketWidth, observed)
+        : -1;
     trace.push({
       index: step,
       prefixLen: prefix.length,
@@ -204,13 +214,17 @@ function replayTraceWithWidthOverride(
   atStep: number,
   overrideWidth: number,
 ): StepTrace[] {
+  const base = withTrace(cfg);
   const prefix: number[] = [];
   const trace: StepTrace[] = [];
   for (let step = 0; step < cover.length; step++) {
-    const stepCfg = step === atStep ? { ...cfg, bucketWidth: overrideWidth } : cfg;
+    const stepCfg = step === atStep ? { ...base, bucketWidth: overrideWidth } : base;
     const plan = planStep(source.logits(prefix), stepCfg);
     const observed = cover[step]!;
-    const j = plan.ranking.indexOf(observed);
+    const j =
+      observed >= 0 && observed < plan.quant.length
+        ? rankOfQuantized(plan.quant, stepCfg.bucketWidth, observed)
+        : -1;
     trace.push({
       index: step,
       prefixLen: prefix.length,

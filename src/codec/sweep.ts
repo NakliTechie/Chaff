@@ -14,7 +14,7 @@
 import { loadPins } from "../pins.js";
 import { referenceLMFromPins } from "../inference/factory.js";
 import { SplitMix64 } from "../util/prng.js";
-import { encode, planStep, type CoderConfig } from "./coder.js";
+import { encode, planStep, rankOfQuantized, type CoderConfig } from "./coder.js";
 import type { LogitSource } from "../inference/types.js";
 
 export interface SweepPoint {
@@ -102,14 +102,14 @@ export function runSweep(
       const clean = source.logits(prefix);
       const cleanPlan = planStep(clean, cfg);
       const observed = enc.cover[step]!;
-      const jClean = cleanPlan.ranking.indexOf(observed);
+      const jClean = rankOfQuantized(cleanPlan.quant, cfg.bucketWidth, observed);
       for (const epsilon of opts.epsilons) {
         const acc = agree.get(epsilon)!;
         for (let t = 0; t < opts.trials; t++) {
           const seed = BigInt(0xc0ffee + step * 2654435761 + t * 40503);
           const noisy = addNoise(clean, epsilon, seed);
           const noisyPlan = planStep(noisy, cfg);
-          const jNoisy = noisyPlan.ranking.indexOf(observed);
+          const jNoisy = rankOfQuantized(noisyPlan.quant, cfg.bucketWidth, observed);
           const ok = noisyPlan.k === cleanPlan.k && jNoisy === jClean;
           if (ok) acc.hit++;
           acc.total++;
